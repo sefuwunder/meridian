@@ -596,6 +596,171 @@ export async function collectOpenalex(ctx: Ctx): Promise<SourceResult> {
   };
 }
 
+// ---------- 15. disaster alerts (GDACS) ----------
+// GDACS API, keyless, free with attribution ("Global Disaster Alert and
+// Coordination System, GDACS"). SEARCH endpoint per the official swagger
+// docs: https://www.gdacs.org/gdacsapi/api/Events/geteventlist/SEARCH with
+// filters eventlist (EQ/TC/FL/VO/DR/WF), fromdate/todate, alertlevel, and
+// pagination (pagenumber/pagesize). The exact parameter spelling and the
+// response envelope were NOT verified against live traffic from this
+// environment, so parsing is defensive: a bare array, a GeoJSON
+// FeatureCollection, or { events: [...] } / { results: [...] } are all
+// accepted; unrecognized shapes yield zero nodes, never a throw.
+
+const GDACS_TYPES = "EQ,TC,FL,VO,DR,WF";
+const GDACS_NEAR_KM = 250; // centroid within this radius of the city counts as relevant
+
+const GDACS_LABEL: Record<string, string> = {
+  EQ: "earthquake", TC: "cyclone", FL: "flood",
+  VO: "volcano", DR: "drought", WF: "wildfire",
+};
+
+function gdacsRecords(j: any): any[] {
+  if (Array.isArray(j)) return j;
+  if (Array.isArray(j?.features))
+    return j.features.map((f: any) => ({ ...(f?.properties || {}), geometry: f?.geometry }));
+  if (Array.isArray(j?.events)) return j.events;
+  if (Array.isArray(j?.results)) return j.results;
+  return [];
+}
+
+function gdacsCentroid(e: any): { lat?: number; lon?: number } {
+  const coords = e?.geometry?.coordinates;
+  if (Array.isArray(coords) && coords.length >= 2) {
+    const lon = Number(coords[0]), lat = Number(coords[1]);
+    if (Number.isFinite(lat) && Number.isFinite(lon)) return { lat, lon };
+  }
+  const lat = Number(e?.latitude ?? e?.lat ?? e?.centroidLat);
+  const lon = Number(e?.longitude ?? e?.lon ?? e?.lng ?? e?.centroidLon);
+  return {
+    lat: Number.isFinite(lat) ? lat : undefined,
+    lon: Number.isFinite(lon) ? lon : undefined,
+  };
+}
+
+function gdacsCountries(e: any): string[] {
+  const c = e?.countries ?? e?.country ?? e?.affectedCountries ?? e?.countrylist;
+  if (Array.isArray(c))
+    return c.map((x: any) => (typeof x === "string" ? x : String(x?.name ?? x?.code ?? "")))
+      .map((s: string) => s.trim()).filter(Boolean);
+  if (typeof c === "string") return c.split(/[;,|]/).map((s) => s.trim()).filter(Boolean);
+  return [];
+}
+
+function havKm(lat1: number, lon1: number, lat2: number, lon2: number): number {
+  const R = 6371, r = Math.PI / 180;
+  const dLat = (lat2 - lat1) * r, dLon = (lon2 - lon1) * r;
+  const a = Math.sin(dLat / 2) ** 2 +
+    Math.cos(lat1 * r) * Math.cos(lat2 * r) * Math.sin(dLon / 2) ** 2;
+  return 2 * R * Math.asin(Math.sqrt(Math.min(1, a)));
+}
+
+// Relevant = country list matches the recon's country/code, or the event
+// centroid is close to the city. Everything else is dropped — a global
+// disaster feed would otherwise flood the graph.
+function gdacsRelevant(e: any, ctx: Ctx): boolean {
+  const want = [ctx.country, ctx.countryCode].filter(Boolean).map((s) => s.toLowerCase());
+  const countries = gdacsCountries(e).map((s) => s.toLowerCase());
+  if (want.length && countries.length &&
+    countries.some((c) => want.some((w) => c === w || c.includes(w) || w.includes(c)))) return true;
+  const { lat, lon } = gdacsCentroid(e);
+  if (lat !== undefined && lon !== undefined && havKm(ctx.lat, ctx.lon, lat, lon) <= GDACS_NEAR_KM) return true;
+  return false;
+}
+
+export async function collectGdacs(ctx: Ctx): Promise<SourceResult> {
+  const to = new Date();
+  const from = new Date(to.getTime() - 90 * 86400000);
+  const iso = (d: Date) => d.toISOString().slice(0, 10);
+  const j = await fetchJson(
+    `https://www.gdacs.org/gdacsapi/api/Events/geteventlist/SEARCH` +
+    `?eventlist=${GDACS_TYPES}&fromdate=${iso(from)}&todate=${iso(to)}&pagesize=100`,
+    {}, 30000);
+  const nodes: GNode[] = [];
+  const seen = new Set<string>();
+  for (const e of gdacsRecords(j)) {
+    if (!e || typeof e !== "object") continue;
+    const eventid = String(e?.eventid ?? e?.id ?? "").trim();
+    if (!eventid || seen.has(eventid)) continue;
+    if (!gdacsRelevant(e, ctx)) continue;
+    seen.add(eventid);
+    const type = String(e?.eventtype ?? e?.type ?? "").toUpperCase();
+    const alert = String(e?.alertlevel ?? e?.alertLevel ?? "").toLowerCase();
+    const title = String(e?.title ?? e?.name ?? "").trim() ||
+      `${GDACS_LABEL[type] || "disaster"} ${eventid}`;
+    const when = String(e?.fromdate ?? e?.fromDate ?? e?.date ?? "").slice(0, 10);
+    const countries = gdacsCountries(e);
+    const { lat, lon } = gdacsCentroid(e);
+    const report = String(e?.url ?? e?.link ?? e?.reportUrl ?? "").trim() ||
+      `https://www.gdacs.org/report.aspx?eventid=${encodeURIComponent(eventid)}` +
+      (e?.episodeid ? `&episodeid=${encodeURIComponent(String(e.episodeid))}` : "");
+    nodes.push({
+      id: `gdacs:${slug(eventid)}`, label: title.slice(0, 90),
+      type: "news" as NodeType, subtype: "disaster", source: "gdacs",
+      detail: [GDACS_LABEL[type] || type.toLowerCase(), alert ? `alert ${alert}` : "",
+        when, countries.slice(0, 4).join(", ")].filter(Boolean).join(" · "),
+      url: report, lat, lon,
+    });
+    if (nodes.length >= 20) break;
+  }
+  return {
+    nodes,
+    edges: nodes.map((n) => ({ from: n.id, to: ctx.cityId, label: "affects" })),
+    note: `${nodes.length} disaster alerts (90d)`,
+  };
+}
+
+// ---------- 16. historic newspapers (Library of Congress Chronicling America) ----------
+// Keyless OpenSearch JSON, per https://chroniclingamerica.loc.gov/about/api/:
+// /search/pages/results/?andtext={q}&format=json — "no special key".
+// LC guideline is ~10 req/min, so this collector makes ONE request per
+// recon: a single city query, sequential, no burst. US-only archive
+// (1770–1963): non-US cities no-op cleanly with zero nodes and a success
+// status. Response shape parsed defensively — not verified against live
+// traffic from this environment.
+
+export async function collectChronicling(ctx: Ctx): Promise<SourceResult> {
+  if (ctx.countryCode !== "US") {
+    return { nodes: [], edges: [], note: "US archive — skipped (city outside the US)" };
+  }
+  const j = await fetchJson(
+    `https://chroniclingamerica.loc.gov/search/pages/results/` +
+    `?andtext=${encodeURIComponent(ctx.city)}&format=json`,
+    {}, 30000);
+  const items = Array.isArray(j?.items) ? j.items
+    : Array.isArray(j?.results) ? j.results : [];
+  const nodes: GNode[] = [];
+  const seen = new Set<string>();
+  for (const it of items.slice(0, 12)) {
+    if (!it || typeof it !== "object") continue;
+    const lccn = String(it?.lccn ?? "").trim();
+    const date = String(it?.date ?? "").slice(0, 10);
+    const seq = String(it?.sequence ?? it?.seq ?? "").trim();
+    const title = String(it?.title ?? "").trim();
+    if (!title) continue;
+    const id = `loc:${slug(lccn || title)}:${slug(date || "nodate")}${seq ? `-${slug(seq)}` : ""}`;
+    if (seen.has(id)) continue;
+    seen.add(id);
+    const paper = String(it?.newspaper ?? it?.paper ?? "").trim();
+    const place = String(it?.place_of_publication ?? "").trim();
+    const url = String(it?.url ?? it?.id ?? "").trim() ||
+      (lccn && date
+        ? `https://chroniclingamerica.loc.gov/lccn/${lccn}/${date}/ed-1/seq-${seq || "1"}/`
+        : undefined);
+    nodes.push({
+      id, label: title.slice(0, 90), type: "news" as NodeType, subtype: "historic press",
+      source: "chronicling",
+      detail: [paper, place, date].filter(Boolean).join(" · "),
+      url,
+    });
+  }
+  return {
+    nodes,
+    edges: nodes.map((n) => ({ from: n.id, to: ctx.cityId, label: "mentions" })),
+    note: `${nodes.length} historic pages (1770–1963)`,
+  };
+}
+
 export const SOURCE_DEFS = [
   { key: "geocode", label: "Geocode · OpenStreetMap" },
   { key: "overpass", label: "Places · OpenStreetMap" },
@@ -611,6 +776,8 @@ export const SOURCE_DEFS = [
   { key: "gleif", label: "Legal entities · GLEIF" },
   { key: "opensky", label: "Live aircraft · OpenSky" },
   { key: "openalex", label: "Research · OpenAlex" },
+  { key: "gdacs", label: "Disasters · GDACS" },
+  { key: "chronicling", label: "Historic press · Library of Congress" },
 ];
 
 // ---------- keyword interlinking ----------

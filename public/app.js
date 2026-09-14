@@ -754,6 +754,7 @@ function renderSourceChecks() {
     ["business", "companies"], ["people", "people"], ["music", "music"],
     ["news", "news"], ["country", "country"], ["moneytime", "money+time"], ["weather", "weather"],
     ["gdelt", "events"], ["gleif", "legal entities"], ["opensky", "aircraft"], ["openalex", "research"],
+    ["gdacs", "disasters"], ["chronicling", "historic press"],
   ];
   for (const [key, label] of defs) {
     const l = document.createElement("label");

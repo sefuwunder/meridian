@@ -39,6 +39,8 @@ the header tracks elapsed time.
 | 12 | GLEIF LEI (CC0) | legal entities registered in the city + direct/ultimate parent links |
 | 13 | OpenSky Network | live aircraft over the city (callsign, altitude, speed, heading) |
 | 14 | OpenAlex (CC0) | research institutions + notable affiliated authors |
+| 15 | GDACS | disaster alerts (earthquake, cyclone, flood, volcano, drought, wildfire) from the last 90 days, filtered to events in the recon's country or within ~250 km of the city; nodes carry alert level, event type, date, and report link. Keyless, free with attribution. |
+| 16 | Library of Congress Chronicling America | historic US newspaper pages (1770–1963) mentioning the city: newspaper title, place of publication, date, link to the LOC page. Keyless, US public domain. One query per recon (~10 req/min guideline); non-US cities skip cleanly. |
 
 Every source is best-effort and independent: one dead API marks its row failed
 in the collection panel and the sprint continues. Nothing is ever half-merged —
