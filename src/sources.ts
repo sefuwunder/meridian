@@ -10,6 +10,7 @@ export type NodeType =
 export interface GNode {
   id: string; label: string; type: NodeType; subtype?: string;
   source: string; detail?: string; url?: string; lat?: number; lon?: number;
+  deepSearched?: boolean;
 }
 export interface GEdge { from: string; to: string; label: string; kind?: string }
 export interface SourceResult { nodes: GNode[]; edges: GEdge[]; note?: string }
@@ -676,6 +677,137 @@ export function addKeywordEdges(
     out.push({ from: a, to: b, label: [...kws].slice(0, 3).join(", "), kind: "keyword" });
   }
   return out;
+}
+
+// City/country name tokens, shared by keyword interlinking and deep search
+// (they'd otherwise link/search everything).
+export function cityExcludeTokens(city: string, country: string | null): string[] {
+  return (city + " " + (country || "")).toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 3);
+}
+
+// ---------- directed deep search ----------
+// Pick any node: its contents (label, subtype, detail) go through the SAME
+// extractKeywords used for interlinking — verbatim, no second extractor —
+// then the top keywords are searched against three keyless backends. New
+// nodes graft onto the graph with edges back to the source node.
+// Every backend is best-effort: a failing backend yields empty results for
+// its keywords, never a throw out of deepSearchNode.
+
+const DS_KEYWORDS = 6;    // keyword budget per deep search
+const DS_PER_BACKEND = 8; // node cap per keyword per backend
+
+export function deepSearchKeywords(node: GNode, city: string, country: string | null): string[] {
+  const text = [node.label, node.subtype, (node.detail || "").slice(0, 300)].filter(Boolean).join(" ");
+  const exclude = new Set(cityExcludeTokens(city, country));
+  return extractKeywords(text).filter((kw) => !exclude.has(kw)).slice(0, DS_KEYWORDS);
+}
+
+async function dsGdelt(kw: string): Promise<GNode[]> {
+  const j = await fetchJson(
+    `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(kw)}` +
+    `&mode=artlist&maxrecords=10&format=json`, {}, 25000);
+  const articles = Array.isArray(j?.articles) ? j.articles : [];
+  const out: GNode[] = [];
+  for (const a of articles.slice(0, DS_PER_BACKEND)) {
+    const title = String(a?.title || "").trim();
+    const domain = String(a?.domain || a?.sourceCommonName || "").trim();
+    const seendate = String(a?.seendate || "").trim();
+    const url = String(a?.url || "").trim();
+    const label = (title || domain || "untitled").slice(0, 90);
+    if (!title && !url) continue;
+    out.push({
+      id: `gdelt:${slug(label)}`, label, type: "news" as NodeType, subtype: "event",
+      source: "deep-search:gdelt",
+      detail: [domain, seendate].filter(Boolean).join(" · "),
+      url: url || undefined,
+    });
+  }
+  return out;
+}
+
+// Wikipedia search API (not the page-summary endpoint the profile
+// collector uses): { query: { search: [ { pageid, title, snippet } ] } }.
+// Snippets carry <span class="searchmatch"> markup — stripped for detail.
+function wpGuessType(hay: string): { type: NodeType; subtype: string } {
+  if (/actor|actress|musician|singer|politician|scientist|writer|author|player|footballer|artist|director|founder|activist/i.test(hay))
+    return { type: "person", subtype: "wikipedia" };
+  if (/city|town|village|district|river|mountain|country|island|neighbourhood|neighborhood|province|state/i.test(hay))
+    return { type: "place", subtype: "wikipedia" };
+  return { type: "org", subtype: "wikipedia" };
+}
+
+async function dsWikipedia(kw: string): Promise<GNode[]> {
+  const j = await fetchJson(
+    `https://en.wikipedia.org/w/api.php?action=query&list=search&srsearch=${encodeURIComponent(kw)}` +
+    `&format=json&srlimit=10&origin=*`, {}, 25000);
+  const results = Array.isArray(j?.query?.search) ? j.query.search : [];
+  const out: GNode[] = [];
+  for (const r of results.slice(0, DS_PER_BACKEND)) {
+    const title = String(r?.title || "").trim();
+    const pageid = Number(r?.pageid);
+    if (!title || !Number.isFinite(pageid)) continue;
+    const { type, subtype } = wpGuessType(String(r?.snippet || ""));
+    out.push({
+      id: `wp:${pageid}`, label: title.slice(0, 90), type, subtype,
+      source: "deep-search:wikipedia",
+      detail: String(r?.snippet || "").replace(/<[^>]*>/g, "").slice(0, 200),
+      url: `https://en.wikipedia.org/?curid=${pageid}`,
+    });
+  }
+  return out;
+}
+
+async function dsWikidata(kw: string): Promise<GNode[]> {
+  const j = await fetchJson(
+    `https://www.wikidata.org/w/api.php?action=wbsearchentities&search=${encodeURIComponent(kw)}` +
+    `&language=en&format=json&limit=10&origin=*`, {}, 25000);
+  const results = Array.isArray(j?.search) ? j.search : [];
+  const out: GNode[] = [];
+  for (const r of results.slice(0, DS_PER_BACKEND)) {
+    const qid = String(r?.id || "").trim();
+    const label = String(r?.label || "").trim();
+    if (!qid || !label) continue;
+    const { type } = wpGuessType(String(r?.description || ""));
+    out.push({
+      id: `wd:${qid.toLowerCase()}`, label: label.slice(0, 90), type, subtype: "wikidata",
+      source: "deep-search:wikidata",
+      detail: String(r?.description || "").slice(0, 200),
+      url: `https://www.wikidata.org/wiki/${qid}`,
+    });
+  }
+  return out;
+}
+
+export interface DeepSearchResult extends SourceResult { keywords: string[] }
+
+// Dedupe: never emit a node whose id or non-empty URL already exists in the
+// recon — so a repeat deep search of the same node adds zero nodes.
+export async function deepSearchNode(
+  node: GNode,
+  existing: GNode[],
+  opts: { city: string; country: string | null }
+): Promise<DeepSearchResult> {
+  const keywords = deepSearchKeywords(node, opts.city, opts.country);
+  const seenIds = new Set(existing.map((n) => n.id));
+  const seenUrls = new Set(existing.map((n) => n.url).filter((u): u is string => !!u));
+  const nodes: GNode[] = [];
+  const edges: GEdge[] = [];
+  const take = (cands: GNode[], kw: string) => {
+    for (const n of cands) {
+      if (seenIds.has(n.id)) continue;
+      if (n.url && seenUrls.has(n.url)) continue;
+      seenIds.add(n.id);
+      if (n.url) seenUrls.add(n.url);
+      nodes.push(n);
+      edges.push({ from: node.id, to: n.id, label: `deep search: ${kw}` });
+    }
+  };
+  for (const kw of keywords) {
+    try { take(await dsGdelt(kw), kw); } catch { /* one backend failing never sinks the others */ }
+    try { take(await dsWikipedia(kw), kw); } catch { /* best effort */ }
+    try { take(await dsWikidata(kw), kw); } catch { /* best effort */ }
+  }
+  return { nodes, edges, keywords, note: `${nodes.length} deep-search nodes` };
 }
 
 // Merge a collector result into the running graph: nodes dedupe by id

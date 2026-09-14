@@ -56,6 +56,26 @@ Portuguese are dropped, and a keyword appearing on more than 15 nodes is
 treated as noise. Recomputed from scratch after every source and every analyst
 note, so links never duplicate and labels stay current.
 
+## Directed deep search
+
+Click any node and hit **deep search**: the node's label, subtype, and
+description are run through the same keyword extractor as the interlinking
+above (top 6 keywords after stopword / city-exclusion / noise filtering),
+and each keyword is searched against three keyless backends:
+
+- **GDELT 2.0 DOC API** — recent news/events mentioning the keyword (≤8 per keyword)
+- **Wikipedia search API** — matching articles, typed person/org/place from their description (≤8)
+- **Wikidata entity search** — matching entities with descriptions (≤8)
+
+New nodes reuse the existing `news`/`org`/`person`/`place` types, so the
+filters, detail panel, and keyword interlinking pick them up with no graph
+changes. Each new node gets an edge back to the original node labeled
+`deep search: <keyword>`. Dedupe is strict: a node whose id or URL already
+exists in the recon is never added, so re-running a deep search only adds
+genuinely new material. The searched node is flagged (the button then reads
+"deep search again"). Backends are isolated — if one fails or returns junk,
+the others still deliver.
+
 ## Graph interaction
 
 - **Pan / zoom / drag** — drag the background to pan, scroll to zoom, drag any
@@ -74,6 +94,9 @@ note, so links never duplicate and labels stay current.
 - **Search** — live highlight + jump-to.
 - **+ note** — pin an analyst note node onto the graph, linked to the selected
   node (or the city). Your own intel, in the web.
+- **Deep search** — one click on any node pulls its keywords through GDELT,
+  Wikipedia, and Wikidata and grafts the new nodes onto the graph with
+  edges back to the node you searched from.
 - **City dossier** — local time, weather, currency + USD rate, languages, dial
   code, region, and the Wikipedia profile, all in the right rail.
 - **Export** — full recon as JSON, nodes as CSV.
@@ -86,6 +109,7 @@ GET  /api/recon                                            # list recons
 GET  /api/recon/:id                                        # full graph + source states + progress
 DEL  /api/recon/:id
 POST /api/recon/:id/notes  { label, body, link_to? } → { node }
+POST /api/recon/:id/deep-search { nodeId } → { addedNodes, addedEdges, keywords }
 GET  /api/recon/:id/export                                 # JSON download
 ```
 

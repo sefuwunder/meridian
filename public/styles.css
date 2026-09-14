@@ -115,6 +115,8 @@ textarea{min-height:90px; resize:vertical; font-family:inherit}
 .empty{color:var(--mut); font-size:12.5px}
 .kv{font-size:12px; color:var(--mut); margin:4px 0}
 .kv b{color:var(--txt); font-weight:600}
+.dsbtn{margin-top:10px; width:100%; padding:8px}
+.dsbtn:disabled{opacity:.6; cursor:wait}
 
 .modal-back{position:fixed; inset:0; background:rgba(4,6,12,.6); backdrop-filter:blur(4px);
   display:flex; align-items:center; justify-content:center; z-index:20}

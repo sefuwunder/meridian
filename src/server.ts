@@ -6,7 +6,8 @@ import {
   createRecon, getRecon, listRecons, updateRecon, deleteRecon, fullRecon,
 } from "./db";
 import {
-  SOURCE_DEFS, mergeGraph, addKeywordEdges, collectGeocode, collectOverpass, collectWikipedia,
+  SOURCE_DEFS, mergeGraph, addKeywordEdges, cityExcludeTokens, deepSearchNode,
+  collectGeocode, collectOverpass, collectWikipedia,
   collectBusiness, collectPeople, collectMusic, collectNews,
   collectCountry, collectMoneyTime, collectWeather,
   collectGdelt, collectGleif, collectOpensky, collectOpenalex,
@@ -39,14 +40,11 @@ const COLLECTORS: Record<string, (ctx: Ctx) => Promise<SourceResult>> = {
   openalex: collectOpenalex,
 };
 
-function excludeTokensFor(city: string, country: string | null): string[] {
-  return (city + " " + (country || "")).toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 3);
-}
-
 // Interlink the graph: any two non-city nodes sharing a keyword get an edge.
 // Recomputed from scratch each pass so labels stay current and never duplicate.
+// City/country tokens use the same exclusion list as deep search.
 function interlink(nodes: GNode[], edges: GEdge[], city: string, country: string | null): GEdge[] {
-  return addKeywordEdges(nodes, edges, { excludeTokens: excludeTokensFor(city, country) });
+  return addKeywordEdges(nodes, edges, { excludeTokens: cityExcludeTokens(city, country) });
 }
 
 async function runRecon(id: string, city: string, wanted: string[]) {
@@ -170,6 +168,32 @@ const server = Bun.serve({
         merged.edges = interlink(merged.nodes, merged.edges, f.city, f.country);
         updateRecon(row.id, { nodes_json: JSON.stringify(merged.nodes), edges_json: JSON.stringify(merged.edges) });
         return json({ node }, 201);
+      }
+      const dsMatch = path.match(/^\/api\/recon\/([^/]+)\/deep-search$/);
+      if (dsMatch && method === "POST") {
+        const row = getRecon(dsMatch[1]);
+        if (!row) return json({ error: "not found" }, 404);
+        const b = await readBody(req);
+        const nodeId = String(b.nodeId || "");
+        if (!nodeId) return json({ error: "nodeId is required" }, 400);
+        const f = fullRecon(row);
+        const target = f.nodes.find((n: GNode) => n.id === nodeId);
+        if (!target) return json({ error: "node not found" }, 404);
+        // same merge path as analyst notes: merge + keyword-edge recomputation
+        const beforeIds = new Set(f.nodes.map((n: GNode) => n.id));
+        const ekey = (e: GEdge) => `${e.from}>${e.to}:${e.label}`;
+        const beforeEdges = new Set(f.edges.map(ekey));
+        const ds = await deepSearchNode(target, f.nodes, { city: f.city, country: f.country });
+        let { nodes, edges } = mergeGraph({ nodes: f.nodes, edges: f.edges }, ds);
+        edges = interlink(nodes, edges, f.city, f.country);
+        const flagged = nodes.find((n) => n.id === nodeId);
+        if (flagged) flagged.deepSearched = true;
+        updateRecon(row.id, { nodes_json: JSON.stringify(nodes), edges_json: JSON.stringify(edges) });
+        return json({
+          addedNodes: nodes.filter((n) => !beforeIds.has(n.id)).length,
+          addedEdges: edges.filter((e) => !beforeEdges.has(ekey(e))).length,
+          keywords: ds.keywords,
+        });
       }
       const rMatch = path.match(/^\/api\/recon\/([^/]+)$/);
       if (rMatch) {

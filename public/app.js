@@ -49,7 +49,7 @@ function syncGraph() {
   for (const n of S.recon.nodes) {
     if (S.sim.has(n.id)) {
       const s = S.sim.get(n.id);
-      Object.assign(s, { label: n.label, type: n.type, subtype: n.subtype, source: n.source, detail: n.detail, url: n.url, lat: n.lat, lon: n.lon });
+      Object.assign(s, { label: n.label, type: n.type, subtype: n.subtype, source: n.source, detail: n.detail, url: n.url, lat: n.lat, lon: n.lon, deepSearched: n.deepSearched });
       s.r = radiusFor(n, degree[n.id]);
       continue;
     }
@@ -398,6 +398,29 @@ function selectNode(id) {
   el.appendChild(meta);
   if (nd.detail) { const b = document.createElement("div"); b.className = "body"; b.textContent = nd.detail; el.appendChild(b); }
   if (nd.url) { const a = document.createElement("a"); a.href = nd.url; a.target = "_blank"; a.rel = "noopener"; a.textContent = nd.url; el.appendChild(a); }
+  // directed deep search: keywords from this node's content -> new nodes grafted on
+  const dsLabel = nd.deepSearched ? "deep search again" : "deep search";
+  const dsBtn = document.createElement("button");
+  dsBtn.className = "dsbtn";
+  dsBtn.textContent = dsLabel;
+  dsBtn.title = "search GDELT, Wikipedia & Wikidata for this node's keywords";
+  dsBtn.onclick = async () => {
+    if (!S.recon) return;
+    dsBtn.disabled = true;
+    dsBtn.textContent = "searching…";
+    try {
+      await api(`/api/recon/${S.recon.id}/deep-search`, {
+        method: "POST", body: JSON.stringify({ nodeId: id }),
+      });
+      await loadRecon(S.recon.id); // incremental re-sync via syncGraph
+      selectNode(id); // refresh the panel → "deep search again"
+    } catch (e) {
+      alert("deep search failed: " + e.message);
+      dsBtn.disabled = false;
+      dsBtn.textContent = dsLabel;
+    }
+  };
+  el.appendChild(dsBtn);
   if (nb.length) {
     const t = document.createElement("div"); t.className = "kv"; t.style.marginTop = "10px";
     t.innerHTML = `<b>${nb.length}</b> connection${nb.length === 1 ? "" : "s"}`;
