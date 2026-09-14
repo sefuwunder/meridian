@@ -76,6 +76,46 @@ genuinely new material. The searched node is flagged (the button then reads
 "deep search again"). Backends are isolated — if one fails or returns junk,
 the others still deliver.
 
+## Rendering performance
+
+The draw loop is built for hundreds of nodes: it never uses alpha blending,
+`shadowBlur`, or per-frame gradients — every translucent paint color is
+pre-blended once against the background into solid hex, node outlines are
+pre-darkened per type, and the dash pattern is one shared array. Per frame:
+
+- edges are drawn in **three batched passes** (solid, dashed keyword, hot)
+  — one `strokeStyle` and one `stroke()` each, dash list toggled twice
+- node fills + outlines are **batched by type** — one fill + one stroke per
+  color instead of per node
+- selected / hovered / city nodes get **solid highlight rings** instead of
+  shadow-blur glows; search matches keep their light ring
+- **one layout read per frame** (the canvas rect is cached; previously every
+  node and edge edge re-measured it)
+- labels are culled at overview zoom (city, selected, hovered, hubs with
+  r ≥ 10.5, search matches) and **truncated to 24 chars** + "…" on canvas
+- the physics loop sleeps once the layout settles (zero idle CPU) and drops
+  to every other physics tick when a tick exceeds ~24ms
+
+The CSS follows the same rule: no `backdrop-filter` anywhere (panels use
+near-opaque solid colors), and the aurora background blobs are static — the
+drift animation is gone, so the compositor rasterises them once instead of
+repainting three huge blurred layers every frame.
+
+Measured on a synthetic 200-node graph (recording stub canvas, per frame):
+
+| expensive op | before | after |
+|---|---|---|
+| `getBoundingClientRect` (layout reads) | ~660 | 1 |
+| `shadowBlur` assignments | ~200 | 0 |
+| `setLineDash` calls | ~40 | 2 |
+| `fillStyle` assignments | ~136 | ~12 |
+| `strokeStyle` assignments | ~289 | ~11 |
+| `globalAlpha` assignments | 0 | 0 |
+| gradient creations | 0 | 0 |
+
+Node titles in the detail panel, neighbor list, and recon list are truncated
+with ellipsis; the full text is on the `title` tooltip.
+
 ## Graph interaction
 
 - **Pan / zoom / drag** — drag the background to pan, scroll to zoom, drag any

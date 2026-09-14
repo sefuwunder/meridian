@@ -12,6 +12,35 @@ const TYPE_LABEL = {
 };
 const ALL_TYPES = Object.keys(COLORS);
 
+// Performance: the draw loop runs every frame, so it must never blend
+// alpha, blur shadows, or allocate gradients. Every translucent paint color
+// is pre-blended once here against the app background (#070b14), the
+// per-type node outline is pre-darkened once, and the dash pattern is a
+// single shared array. The frame loop then only assigns solid colors.
+function shade(hex, amt) {
+  const n = parseInt(hex.slice(1), 16);
+  const m = 1 - amt;
+  const r = Math.round(((n >> 16) & 255) * m), g = Math.round(((n >> 8) & 255) * m), b = Math.round((n & 255) * m);
+  return "#" + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
+}
+const EDGE_SOLID = "#1e2432";     // rgba(150,170,210,.16) over #070b14
+const EDGE_KW_SOLID = "#151b27";  // rgba(150,170,210,.10) over #070b14
+const EDGE_HOT_SOLID = "#876820"; // rgba(240,180,41,.55) over #070b14
+const LABEL_HALO = "#04070d";     // rgba(4,6,12,.85) over #070b14
+const LABEL_FILL = "#d6dbe5";     // rgba(232,237,247,.92) over #070b14
+const MATCH_RING = "#d4d8dc";     // rgba(255,255,255,.8) over #070b14
+const SEL_RING = "#f0b429";
+const NODE_OUTLINE = {};
+for (const t of ALL_TYPES) NODE_OUTLINE[t] = shade(COLORS[t], 0.45);
+const KW_DASH = [4, 5]; // one shared array; setLineDash copies the pattern
+const FONT = "11px -apple-system,Segoe UI,Roboto,sans-serif";
+const FONT_CITY = "700 13px -apple-system,Segoe UI,Roboto,sans-serif";
+const LABEL_MAX = 24; // canvas labels truncated past this length
+function truncLabel(s) {
+  s = s || "";
+  return s.length > LABEL_MAX ? s.slice(0, LABEL_MAX - 1) + "…" : s;
+}
+
 const S = {
   recon: null,
   sim: new Map(),       // id -> {id,label,type,...,x,y,vx,vy,r,hidden,pinned}
@@ -197,61 +226,99 @@ function s2w(px, py) {
 }
 
 function draw() {
-  const r = canvas.getBoundingClientRect();
-  ctx2d.clearRect(0, 0, r.width, r.height);
-  const nodes = visibleNodes();
-  const edges = visibleEdges();
+  // One layout read per frame (was: one per node + one per edge via w2s).
+  const R = canvas.getBoundingClientRect();
+  const W = R.width, H = R.height, k = S.view.k;
+  const vx = S.view.x, vy = S.view.y, ox = W / 2, oy = H / 2;
+  const c = ctx2d;
+  c.clearRect(0, 0, W, H);
+  const nodes = visibleNodes(), edges = visibleEdges(), sel = S.selected;
 
-  ctx2d.lineWidth = 1;
-  for (const e of edges) {
-    const a = S.sim.get(e.from), b = S.sim.get(e.to);
-    if (!a || !b) continue;
-    const [ax, ay] = w2s(a.x, a.y), [bx, by] = w2s(b.x, b.y);
-    if ((ax < -80 && bx < -80) || (ax > r.width + 80 && bx > r.width + 80) ||
-        (ay < -60 && by < -60) || (ay > r.height + 60 && by > r.height + 60)) continue;
-    const hot = S.selected && (e.from === S.selected || e.to === S.selected);
-    const isKw = e.kind === "keyword";
-    ctx2d.strokeStyle = hot ? "rgba(240,180,41,0.55)"
-      : isKw ? "rgba(150,170,210,0.10)" : "rgba(150,170,210,0.16)";
-    if (isKw) ctx2d.setLineDash([4, 5]);
-    ctx2d.beginPath(); ctx2d.moveTo(ax, ay); ctx2d.lineTo(bx, by); ctx2d.stroke();
-    if (isKw) ctx2d.setLineDash([]);
-  }
+  // ---- edges: three batched passes, one strokeStyle + one stroke each.
+  // Solid colors only (no alpha), the dash list toggled exactly twice.
+  const isHot = (e) => sel && (e.from === sel || e.to === sel);
+  const isKw = (e) => e.kind === "keyword" && !isHot(e);
+  c.lineWidth = 1;
+  const strokePass = (pred, style, dash) => {
+    c.strokeStyle = style;
+    if (dash) c.setLineDash(dash);
+    c.beginPath();
+    let any = false;
+    for (const e of edges) {
+      if (!pred(e)) continue;
+      const a = S.sim.get(e.from), b = S.sim.get(e.to);
+      if (!a || !b) continue;
+      const ax = (a.x - vx) * k + ox, ay = (a.y - vy) * k + oy;
+      const bx = (b.x - vx) * k + ox, by = (b.y - vy) * k + oy;
+      if ((ax < -80 && bx < -80) || (ax > W + 80 && bx > W + 80) ||
+          (ay < -60 && by < -60) || (ay > H + 60 && by > H + 60)) continue;
+      c.moveTo(ax, ay); c.lineTo(bx, by); any = true;
+    }
+    if (any) c.stroke();
+    if (dash) c.setLineDash([]);
+  };
+  strokePass((e) => !isHot(e) && !isKw(e), EDGE_SOLID, null);
+  strokePass(isKw, EDGE_KW_SOLID, KW_DASH);
+  strokePass(isHot, EDGE_HOT_SOLID, null);
 
+  // ---- nodes: one fill + one stroke per type (was: per node).
+  // No shadowBlur anywhere — selected / hovered / city nodes get solid
+  // rings instead, and search matches keep their light ring.
   const q = S.search.trim().toLowerCase();
-  for (const nd of nodes) {
-    const [x, y] = w2s(nd.x, nd.y);
-    if (x < -60 || y < -40 || x > r.width + 60 || y > r.height + 40) continue;
-    const rad = nd.r * Math.min(1.6, Math.max(0.7, S.view.k));
-    const isSel = S.selected === nd.id, isHov = S.hovered === nd.id;
-    const match = q && (nd.label || "").toLowerCase().includes(q);
-    if (isSel || isHov || nd.type === "city") {
-      ctx2d.shadowColor = COLORS[nd.type] || "#fff";
-      ctx2d.shadowBlur = 18;
+  const rScale = Math.min(1.6, Math.max(0.7, k));
+  const labels = []; // [text, x, y, isSel, isCity]
+  const rings = [];  // [x, y, rad, style, width]
+  for (const t of ALL_TYPES) {
+    c.fillStyle = COLORS[t];
+    c.beginPath();
+    let any = false;
+    for (const nd of nodes) {
+      if (nd.type !== t) continue;
+      const x = (nd.x - vx) * k + ox, y = (nd.y - vy) * k + oy;
+      if (x < -60 || y < -40 || x > W + 60 || y > H + 40) continue;
+      const rad = nd.r * rScale;
+      c.moveTo(x + rad, y); // keep arcs in one path from connecting
+      c.arc(x, y, rad, 0, Math.PI * 2);
+      any = true;
+      const isSel = sel === nd.id, isHov = S.hovered === nd.id;
+      const match = q && (nd.label || "").toLowerCase().includes(q);
+      if (match && !isSel) rings.push([x, y, rad + 4, MATCH_RING, 1.5]);
+      if (isSel) rings.push([x, y, rad, "#ffffff", 3]);
+      else if (isHov) rings.push([x, y, rad + 4, SEL_RING, 2]);
+      else if (t === "city") rings.push([x, y, rad + 5, SEL_RING, 2]);
+      // at overview zoom only well-connected hubs earn a label; zoom in to name everything
+      if (t === "city" || isSel || isHov || k >= 1.6 || nd.r >= 10.5 || match)
+        labels.push([truncLabel(nd.label), x, y + rad + 13, isSel, t === "city"]);
     }
-    ctx2d.beginPath(); ctx2d.arc(x, y, rad, 0, Math.PI * 2);
-    ctx2d.fillStyle = COLORS[nd.type] || "#fff";
-    ctx2d.fill();
-    ctx2d.shadowBlur = 0;
-    ctx2d.lineWidth = isSel ? 3 : 1.5;
-    ctx2d.strokeStyle = isSel ? "#fff" : "rgba(0,0,0,0.45)";
-    ctx2d.stroke();
-    if (match && !isSel) {
-      ctx2d.beginPath(); ctx2d.arc(x, y, rad + 4, 0, Math.PI * 2);
-      ctx2d.strokeStyle = "rgba(255,255,255,0.8)"; ctx2d.lineWidth = 1.5; ctx2d.stroke();
-    }
-    // at overview zoom only well-connected hubs earn a label; zoom in to name everything
-    const showLabel = nd.type === "city" || isSel || isHov || S.view.k >= 1.6 || nd.r >= 10.5 || match;
-    if (showLabel) {
-      ctx2d.font = (nd.type === "city" ? "700 13px" : "11px") + " -apple-system,Segoe UI,Roboto,sans-serif";
-      ctx2d.textAlign = "center";
-      ctx2d.lineWidth = 3; ctx2d.strokeStyle = "rgba(4,6,12,0.85)";
-      const ly = y + rad + 13;
-      ctx2d.strokeText(nd.label, x, ly);
-      ctx2d.fillStyle = isSel ? "#fff" : "rgba(232,237,247,0.92)";
-      ctx2d.fillText(nd.label, x, ly);
+    if (any) {
+      c.fill();
+      c.lineWidth = 1.5;
+      c.strokeStyle = NODE_OUTLINE[t];
+      c.stroke();
     }
   }
+
+  // ---- highlight rings: a handful per frame, all solid ----
+  for (const [x, y, rad, style, w] of rings) {
+    c.beginPath(); c.arc(x, y, rad, 0, Math.PI * 2);
+    c.strokeStyle = style; c.lineWidth = w; c.stroke();
+  }
+
+  // ---- labels: two batched passes, truncated, solid halo ----
+  c.textAlign = "center";
+  c.lineWidth = 3;
+  c.strokeStyle = LABEL_HALO;
+  const paintLabels = (font, items) => {
+    if (!items.length) return;
+    c.font = font;
+    for (const [text, x, y, isSel] of items) {
+      c.strokeText(text, x, y);
+      c.fillStyle = isSel ? "#ffffff" : LABEL_FILL;
+      c.fillText(text, x, y);
+    }
+  };
+  paintLabels(FONT_CITY, labels.filter((l) => l[4]));
+  paintLabels(FONT, labels.filter((l) => !l[4]));
 }
 
 // The render loop sleeps when the layout settles: wake() reheats it,
@@ -389,6 +456,7 @@ function selectNode(id) {
   head.innerHTML = `<span class="sw" style="width:12px;height:12px;border-radius:50%;background:${color};display:inline-block"></span>
     <h4></h4><span class="pill" style="background:${color}22;color:${color}">${TYPE_LABEL[nd.type] || nd.type}</span>`;
   head.querySelector("h4").textContent = nd.label;
+  head.querySelector("h4").title = nd.label || "";
   el.appendChild(head);
   const meta = document.createElement("div");
   meta.innerHTML =
@@ -731,6 +799,6 @@ if (document.readyState === "loading") document.addEventListener("DOMContentLoad
 else boot();
 
 // test seam
-window.__meridian = { S, COLORS, syncGraph, tick, applyFilters, searchNodes, hitNode, centerOn, fit, w2s, s2w, selectNode, radiusFor, wake, kick, loop };
+window.__meridian = { S, COLORS, syncGraph, tick, draw, applyFilters, searchNodes, hitNode, centerOn, fit, w2s, s2w, selectNode, radiusFor, wake, kick, loop, truncLabel };
 
 })();
