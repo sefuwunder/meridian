@@ -1,0 +1,81 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>meridian — graph OSINT recon</title>
+<link rel="stylesheet" href="/styles.css">
+</head>
+<body>
+<div class="bg" aria-hidden="true"><i class="b1"></i><i class="b2"></i><i class="b3"></i></div>
+
+<header class="topbar">
+  <div class="brand"><span class="mark">◈</span> meridian</div>
+  <div class="recon-title" id="reconTitle">no recon loaded</div>
+  <div class="clock" id="sprintClock" title="time since this recon started">--:--:--</div>
+  <div class="top-actions">
+    <button id="btnFit" title="fit graph to view">fit</button>
+    <button id="btnPause" title="pause / resume the layout">pause</button>
+    <button id="btnNote" title="add an analyst note node">+ note</button>
+    <button id="btnExport" title="download recon as JSON">export</button>
+    <button id="btnCsv" title="download nodes as CSV">csv</button>
+  </div>
+</header>
+
+<aside class="left">
+  <section class="panel">
+    <h3>new recon sprint</h3>
+    <input id="cityInput" placeholder="city — e.g. Dakar, Senegal" autocomplete="off">
+    <div class="sources-check" id="sourceChecks"></div>
+    <button id="btnLaunch" class="primary">launch recon</button>
+    <p class="fine">ten keyless sources. failures are contained — one dead source never kills the sprint.</p>
+  </section>
+  <section class="panel" id="collectPanel" hidden>
+    <h3>collection</h3>
+    <div class="progress"><div id="progressBar"></div></div>
+    <div id="progressLabel" class="fine"></div>
+    <ul class="sources" id="sourceList"></ul>
+  </section>
+  <section class="panel grow">
+    <h3>recons</h3>
+    <ul class="recons" id="reconList"></ul>
+  </section>
+</aside>
+
+<main class="stage">
+  <canvas id="graph"></canvas>
+  <div class="stage-top">
+    <input id="searchInput" placeholder="search nodes…" autocomplete="off">
+    <div id="searchResults" hidden></div>
+  </div>
+  <div class="chips" id="typeChips"></div>
+  <div class="hint">drag to pan · scroll to zoom · drag a node to move it · click a node for detail</div>
+  <div class="counts" id="graphCounts"></div>
+</main>
+
+<aside class="right">
+  <section class="panel" id="dossierPanel" hidden>
+    <h3>city dossier</h3>
+    <div class="facts" id="dossierFacts"></div>
+  </section>
+  <section class="panel grow">
+    <h3>node detail</h3>
+    <div id="nodeDetail" class="empty">click any node in the web</div>
+  </section>
+</aside>
+
+<div class="modal-back" id="noteModal" hidden>
+  <div class="modal">
+    <h3>analyst note</h3>
+    <input id="noteLabel" placeholder="short label" autocomplete="off">
+    <textarea id="noteBody" placeholder="what did you find? paste intel, hunches, follow-ups…"></textarea>
+    <div class="row">
+      <button id="noteSave" class="primary">add to graph</button>
+      <button id="noteCancel">cancel</button>
+    </div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
