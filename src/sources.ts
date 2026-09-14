@@ -383,6 +383,218 @@ export async function collectWeather(ctx: Ctx): Promise<SourceResult> {
   };
 }
 
+// ---------- 11. live events & headlines (GDELT 2.0 DOC API) ----------
+// GDELT 2.0 DOC API, artlist mode. Response shape (per GDELT docs / public
+// API knowledge; not verified live from this environment — parsed
+// defensively): { articles: [ { title, url, seendate, domain, language,
+// sourcecountry, ... } ] }. A missing/empty articles list yields zero nodes,
+// never a throw.
+
+export async function collectGdelt(ctx: Ctx): Promise<SourceResult> {
+  const j = await fetchJson(
+    `https://api.gdeltproject.org/api/v2/doc/doc?query=${encodeURIComponent(ctx.city)}` +
+    `&mode=artlist&maxrecords=50&format=json`, {}, 25000);
+  const articles = Array.isArray(j?.articles) ? j.articles : [];
+  const nodes: GNode[] = [];
+  for (const a of articles.slice(0, 40)) {
+    const title = String(a?.title || "").trim();
+    const domain = String(a?.domain || a?.sourceCommonName || "").trim();
+    const seendate = String(a?.seendate || "").trim();
+    const url = String(a?.url || "").trim();
+    const label = (title || domain || "untitled").slice(0, 90);
+    if (!title && !url) continue;
+    nodes.push({
+      id: `gdelt:${slug(label)}`, label, type: "news" as NodeType, subtype: "event",
+      source: "gdelt",
+      detail: [domain, seendate].filter(Boolean).join(" · "),
+      url: url || undefined,
+    });
+  }
+  return {
+    nodes,
+    edges: nodes.map((n) => ({ from: n.id, to: ctx.cityId, label: "about" })),
+    note: `${nodes.length} GDELT mentions`,
+  };
+}
+
+// ---------- 12. legal entities (GLEIF LEI) ----------
+// GLEIF v1 REST, CC0. Filter syntax below follows GLEIF's documented
+// JSON:API filters (filter[entity.legalAddress.city]) — the parameter shape
+// could not be verified against the live docs from this environment, so a
+// 400/422 from a wrong filter name just fails this source (best-effort),
+// never the recon. Response: { data: [ { id: "<20-char LEI>",
+// attributes: { entity: { legalName: { name }, legalAddress: { addressLines[],
+// city, region, country, postalCode }, status }, relationships:
+// { "direct-parent": { "relationship-record": { relationship:
+// { endNode: { id } } } }, "ultimate-parent": ... } } } ] }.
+
+const LEI_RE = /^[A-Z0-9]{20}$/;
+
+function gleifAddress(e: any): string {
+  const a = e?.legalAddress || {};
+  const lines = Array.isArray(a.addressLines) ? a.addressLines : [];
+  return [lines.join(" "), a.city, a.region, a.country, a.postalCode]
+    .filter(Boolean).join(", ").slice(0, 160);
+}
+
+function gleifParentLei(attrs: any, rel: "direct-parent" | "ultimate-parent"): string | null {
+  const rr = attrs?.relationships?.[rel]?.["relationship-record"];
+  const id = rr?.relationship?.endNode?.id || rr?.endNode?.id || null;
+  return typeof id === "string" && LEI_RE.test(id) ? id : null;
+}
+
+export async function collectGleif(ctx: Ctx): Promise<SourceResult> {
+  const j = await fetchJson(
+    `https://api.gleif.org/api/v1/lei-records?filter[entity.legalAddress.city]=${encodeURIComponent(ctx.city)}&page[size]=40`,
+    {}, 30000);
+  const records = Array.isArray(j?.data) ? j.data : [];
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  for (const rec of records.slice(0, 40)) {
+    const lei = String(rec?.id || "").toUpperCase();
+    if (!LEI_RE.test(lei) || seen.has(lei)) continue;
+    seen.add(lei);
+    const ent = rec?.attributes?.entity || {};
+    const name = String(ent?.legalName?.name || lei);
+    const id = `gleif:${lei.toLowerCase()}`;
+    nodes.push({
+      id, label: name.slice(0, 90), type: "org" as NodeType, subtype: "legal entity",
+      source: "gleif",
+      detail: [gleifAddress(ent), ent?.status ? `status ${ent.status}` : ""].filter(Boolean).join(" · "),
+      url: `https://search.gleif.org/#/record/${lei}`,
+    });
+    edges.push({ from: id, to: ctx.cityId, label: "registered in" });
+    for (const rel of ["direct-parent", "ultimate-parent"] as const) {
+      const plei = gleifParentLei(rec?.attributes, rel);
+      if (!plei || plei === lei || seen.has(plei)) continue;
+      seen.add(plei);
+      const pid = `gleif:${plei.toLowerCase()}`;
+      nodes.push({
+        id: pid, label: plei, type: "org" as NodeType, subtype: "parent entity",
+        source: "gleif", detail: `${rel.replace("-", " ")} of ${name.slice(0, 60)} (name not fetched)`,
+        url: `https://search.gleif.org/#/record/${plei}`,
+      });
+      edges.push({ from: id, to: pid, label: rel.replace("-", " ") });
+    }
+  }
+  return {
+    nodes, edges,
+    note: `${nodes.length} legal entities`,
+  };
+}
+
+// ---------- 13. live aircraft (OpenSky Network) ----------
+// Anonymous, keyless. One call per recon — well inside the ~10 req/10s
+// anonymous limit. Response: { states: [ [icao24, callsign, origin_country,
+// time_position, last_contact, lon, lat, baro_altitude, on_ground, velocity,
+// true_track, vertical_rate, ...], ... ] }. Nulls are common; parse
+// defensively.
+
+export async function collectOpensky(ctx: Ctx): Promise<SourceResult> {
+  const pad = 0.05;
+  const b = ctx.bbox;
+  const j = await fetchJson(
+    `https://opensky-network.org/api/states/all?lamin=${(b.s - pad).toFixed(4)}&lomin=${(b.w - pad).toFixed(4)}` +
+    `&lamax=${(b.n + pad).toFixed(4)}&lomax=${(b.e + pad).toFixed(4)}`, {}, 25000);
+  const states = Array.isArray(j?.states) ? j.states : [];
+  const nodes: GNode[] = [];
+  for (const s of states.slice(0, 50)) {
+    if (!Array.isArray(s)) continue;
+    const icao24 = String(s[0] || "").toLowerCase();
+    if (!icao24) continue;
+    const callsign = String(s[1] || "").trim();
+    const country = String(s[2] || "").trim();
+    const lon = Number(s[5]), lat = Number(s[6]);
+    const alt = s[7] == null ? null : Math.round(Number(s[7]));
+    const vel = s[9] == null ? null : Math.round(Number(s[9]) * 3.6);
+    const hdg = s[10] == null ? null : Math.round(Number(s[10]));
+    const label = (callsign || icao24.toUpperCase()).slice(0, 24);
+    nodes.push({
+      id: `adsb:${icao24}`, label, type: "infra" as NodeType, subtype: "aircraft",
+      source: "opensky",
+      detail: [country, alt != null ? `alt ${alt} m` : "", vel != null ? `${vel} km/h` : "",
+        hdg != null ? `hdg ${hdg}°` : ""].filter(Boolean).join(" · "),
+      lat: Number.isFinite(lat) ? lat : undefined,
+      lon: Number.isFinite(lon) ? lon : undefined,
+    });
+  }
+  return {
+    nodes,
+    edges: nodes.map((n) => ({ from: n.id, to: ctx.cityId, label: "over" })),
+    note: `${nodes.length} aircraft aloft`,
+  };
+}
+
+// ---------- 14. research (OpenAlex) ----------
+// CC0, keyless. Polite-pool guidance asks for a mailto contact; this
+// environment has no standing contact address, so a descriptive User-Agent
+// with the project URL is used instead of a fabricated mailto.
+// institutions?search=<city> → top institutions; then up to 3 extra calls
+// for top authors of the top 3 institutions (author-call failure never
+// sinks the institutions already collected).
+
+const OA_UA = "meridian-osint/1.0 (local city recon tool; https://github.com/sefuwunder/meridian)";
+
+function openAlexId(url: string): string {
+  const m = /\/([A-Z]\d+)$/.exec(String(url || ""));
+  return m ? m[1] : "";
+}
+
+export async function collectOpenalex(ctx: Ctx): Promise<SourceResult> {
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const j = await fetchJson(
+    `https://api.openalex.org/institutions?search=${encodeURIComponent(ctx.city)}&per-page=25`,
+    { headers: { "User-Agent": OA_UA } }, 25000);
+  const insts = (Array.isArray(j?.results) ? j.results : []).slice(0, 12);
+  const instIds: { id: string; short: string; label: string }[] = [];
+  for (const inst of insts) {
+    const name = String(inst?.display_name || "").trim();
+    if (!name) continue;
+    const short = openAlexId(inst?.id);
+    const id = `openalex:${slug(name)}`;
+    const works = Number(inst?.works_count) || 0;
+    const cc = String(inst?.country_code || "").toUpperCase();
+    nodes.push({
+      id, label: name.slice(0, 90), type: "org" as NodeType, subtype: "research",
+      source: "openalex",
+      detail: [`${works.toLocaleString("en-US")} works`, cc].filter(Boolean).join(" · "),
+      url: String(inst?.homepage_url || inst?.id || "") || undefined,
+    });
+    edges.push({ from: id, to: ctx.cityId, label: "in" });
+    if (short) instIds.push({ id, short, label: name });
+  }
+  for (const inst of instIds.slice(0, 3)) {
+    let a: any = null;
+    try {
+      a = await fetchJson(
+        `https://api.openalex.org/authors?filter=last_known_institutions.id:${inst.short}` +
+        `&per-page=8&sort=works_count:desc`,
+        { headers: { "User-Agent": OA_UA } }, 25000);
+    } catch { continue; } // author lookup is bonus; institutions already landed
+    const authors = (Array.isArray(a?.results) ? a.results : []).slice(0, 5);
+    for (const au of authors) {
+      const name = String(au?.display_name || "").trim();
+      if (!name) continue;
+      const orcid = String(au?.orcid || "").replace(/^https?:\/\/orcid\.org\//, "");
+      const aid = `openalex-author:${slug(name)}`;
+      if (nodes.some((n) => n.id === aid)) continue;
+      nodes.push({
+        id: aid, label: name.slice(0, 90), type: "person" as NodeType, subtype: "researcher",
+        source: "openalex",
+        detail: [`${(Number(au?.works_count) || 0).toLocaleString("en-US")} works`,
+          orcid ? `ORCID ${orcid}` : ""].filter(Boolean).join(" · "),
+        url: orcid ? `https://orcid.org/${orcid}` : (String(au?.id || "") || undefined),
+      });
+      edges.push({ from: aid, to: inst.id, label: "affiliated" });
+    }
+    if (nodes.length >= 30) break;
+  }
+  return {
+    nodes: nodes.slice(0, 30), edges,
+    note: `${nodes.length} institutions & researchers`,
+  };
+}
+
 export const SOURCE_DEFS = [
   { key: "geocode", label: "Geocode · OpenStreetMap" },
   { key: "overpass", label: "Places · OpenStreetMap" },
@@ -394,6 +606,10 @@ export const SOURCE_DEFS = [
   { key: "country", label: "Country dossier · REST Countries" },
   { key: "moneytime", label: "Money & time · ER API" },
   { key: "weather", label: "Weather · Open-Meteo" },
+  { key: "gdelt", label: "Events · GDELT" },
+  { key: "gleif", label: "Legal entities · GLEIF" },
+  { key: "opensky", label: "Live aircraft · OpenSky" },
+  { key: "openalex", label: "Research · OpenAlex" },
 ];
 
 // ---------- keyword interlinking ----------

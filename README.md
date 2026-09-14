@@ -3,11 +3,11 @@
 Land in a foreign city, launch a recon sprint, and watch social, cultural, and
 business intel assemble itself into an interactive web of connected nodes.
 
-`meridian` collects from **ten free, keyless sources** and lays the results out
+`meridian` collects from **fourteen free, keyless sources** and lays the results out
 as a force-directed node graph: the city sits pinned at the hub, everything
 else — restaurants, museums, coworking spaces, embassies, hospitals, companies,
-notable people, artists, headlines, currency, weather, local time — orbits it,
-connected by labeled edges.
+legal entities, notable people, researchers, artists, headlines, live aircraft,
+currency, weather, local time — orbits it, connected by labeled edges.
 
 ## Run it
 
@@ -35,6 +35,10 @@ the header tracks elapsed time.
 | 8 | REST Countries | currency, languages, dial code, driving side, region |
 | 9 | ER API + WorldTimeAPI | USD exchange rate, local time |
 | 10 | Open-Meteo | current weather |
+| 11 | GDELT 2.0 DOC API | near-real-time news/events mentioning the city (title, outlet, seen-date) |
+| 12 | GLEIF LEI (CC0) | legal entities registered in the city + direct/ultimate parent links |
+| 13 | OpenSky Network | live aircraft over the city (callsign, altitude, speed, heading) |
+| 14 | OpenAlex (CC0) | research institutions + notable affiliated authors |
 
 Every source is best-effort and independent: one dead API marks its row failed
 in the collection panel and the sprint continues. Nothing is ever half-merged —
@@ -93,8 +97,13 @@ Recons persist in `data/meridian.db` (SQLite via `bun:sqlite`, gitignored).
   parsers (Overpass JSON, RSS, SPARQL) are hand-rolled.
 - Designed for the "8–10 hour sprint": collection takes ~30–60s; the sprint
   clock and the note tool are for the human hours that follow.
-- Verified 2026-09-14: 41/41 collector + merge checks against stubbed sources,
-  26/26 DOM-stubbed frontend checks (graph build, physics settle, filters,
-  search, hit-testing, selection). No live network calls were made from the
-  build environment — point it at a real city and confirm the sources light up
-  green.
+- Verified 2026-09-14: 64/64 collector + merge checks against stubbed sources
+  (incl. GDELT/GLEIF/OpenSky/OpenAlex mapping, caps, empty-result and
+  HTTP-error isolation), 17/17 keyword-interlink checks, 40/40 DOM-stubbed
+  frontend checks (graph build, physics settle, filters, search, hit-testing,
+  selection, scale behavior). No live network calls were made from the build
+  environment — point it at a real city and confirm the sources light up green.
+  Note: the GDELT articles[] shape and GLEIF's city filter parameter were wired
+  defensively from public API knowledge (could not be re-verified against the
+  live docs from the build environment); both collectors fail closed to an
+  empty result / failed source row without breaking the recon.

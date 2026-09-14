@@ -9,6 +9,7 @@ import {
   SOURCE_DEFS, mergeGraph, addKeywordEdges, collectGeocode, collectOverpass, collectWikipedia,
   collectBusiness, collectPeople, collectMusic, collectNews,
   collectCountry, collectMoneyTime, collectWeather,
+  collectGdelt, collectGleif, collectOpensky, collectOpenalex,
   type Ctx, type GNode, type GEdge, type SourceResult,
 } from "./sources";
 
@@ -32,6 +33,10 @@ const COLLECTORS: Record<string, (ctx: Ctx) => Promise<SourceResult>> = {
   country: collectCountry,
   moneytime: collectMoneyTime,
   weather: collectWeather,
+  gdelt: collectGdelt,
+  gleif: collectGleif,
+  opensky: collectOpensky,
+  openalex: collectOpenalex,
 };
 
 function excludeTokensFor(city: string, country: string | null): string[] {

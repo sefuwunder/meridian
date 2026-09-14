@@ -662,6 +662,7 @@ function renderSourceChecks() {
     ["geocode", "geocode"], ["overpass", "places"], ["wikipedia", "profile"],
     ["business", "companies"], ["people", "people"], ["music", "music"],
     ["news", "news"], ["country", "country"], ["moneytime", "money+time"], ["weather", "weather"],
+    ["gdelt", "events"], ["gleif", "legal entities"], ["opensky", "aircraft"], ["openalex", "research"],
   ];
   for (const [key, label] of defs) {
     const l = document.createElement("label");
