@@ -183,8 +183,12 @@ function draw() {
     if (!a || !b) continue;
     const [ax, ay] = w2s(a.x, a.y), [bx, by] = w2s(b.x, b.y);
     const hot = S.selected && (e.from === S.selected || e.to === S.selected);
-    ctx2d.strokeStyle = hot ? "rgba(240,180,41,0.55)" : "rgba(150,170,210,0.16)";
+    const isKw = e.kind === "keyword";
+    ctx2d.strokeStyle = hot ? "rgba(240,180,41,0.55)"
+      : isKw ? "rgba(150,170,210,0.10)" : "rgba(150,170,210,0.16)";
+    if (isKw) ctx2d.setLineDash([4, 5]);
     ctx2d.beginPath(); ctx2d.moveTo(ax, ay); ctx2d.lineTo(bx, by); ctx2d.stroke();
+    if (isKw) ctx2d.setLineDash([]);
   }
 
   const q = S.search.trim().toLowerCase();

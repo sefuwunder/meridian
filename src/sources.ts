@@ -11,7 +11,7 @@ export interface GNode {
   id: string; label: string; type: NodeType; subtype?: string;
   source: string; detail?: string; url?: string; lat?: number; lon?: number;
 }
-export interface GEdge { from: string; to: string; label: string }
+export interface GEdge { from: string; to: string; label: string; kind?: string }
 export interface SourceResult { nodes: GNode[]; edges: GEdge[]; note?: string }
 
 export interface Ctx {
@@ -25,8 +25,7 @@ export interface Ctx {
 
 const UA = "meridian-osint/1.0 (local recon tool)";
 const slug = (s: string) =>
-  s.toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "")
-    .replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "x";
+  s.toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "").replace(/[^a-z0-9]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 60) || "x";
 
 async function fetchJson(url: string, opts: RequestInit = {}, timeoutMs = 25000): Promise<any> {
   const ctrl = new AbortController();
@@ -396,6 +395,72 @@ export const SOURCE_DEFS = [
   { key: "moneytime", label: "Money & time · ER API" },
   { key: "weather", label: "Weather · Open-Meteo" },
 ];
+
+// ---------- keyword interlinking ----------
+// Any two non-city nodes sharing a keyword get an edge labeled with the
+// shared keyword(s). City/country name tokens are excluded (they'd link
+// everything), stopwords in four languages are dropped, and keywords
+// appearing on more than maxNodesPerKeyword nodes are treated as noise.
+// Re-running strips old keyword edges first, so labels stay current and
+// re-runs never duplicate.
+
+const STOPWORDS = new Set(
+  ("the and for with from that this these those are was were has have had will would " +
+   "can its our your their about into over after before between through during under " +
+   "above among within without also just than then when where which while what been " +
+   "being does each more most other some such only same very should now new old " +
+   "les des une dans sur plus est sont avec pour " +
+   "los las del con una uno " +
+   "dos das uma com por " +
+   "saint sainte").split(" ")
+);
+
+export function extractKeywords(text: string): string[] {
+  const stem = (w: string) =>
+    w.length > 4 && w.endsWith("s") && !w.endsWith("ss") ? w.slice(0, -1) : w;
+  const words = text.toLowerCase().normalize("NFKD").replace(/[\u0300-\u036f]/g, "").split(/[^a-z0-9]+/)
+    .filter((w) => w.length >= 3 && !/^\d+$/.test(w) && !STOPWORDS.has(w))
+    .map(stem);
+  return [...new Set(words)];
+}
+
+export function addKeywordEdges(
+  nodes: GNode[], edges: GEdge[],
+  opts: { excludeTokens?: string[]; maxNodesPerKeyword?: number } = {}
+): GEdge[] {
+  const exclude = new Set((opts.excludeTokens || []).map((t) => t.toLowerCase()));
+  const maxPer = opts.maxNodesPerKeyword ?? 15;
+  const index = new Map<string, string[]>();
+  for (const n of nodes) {
+    if (n.type === "city") continue;
+    const text = [n.label, n.subtype, (n.detail || "").slice(0, 300)].filter(Boolean).join(" ");
+    for (const kw of extractKeywords(text)) {
+      if (exclude.has(kw)) continue;
+      if (!index.has(kw)) index.set(kw, []);
+      index.get(kw)!.push(n.id);
+    }
+  }
+  const pairKw = new Map<string, Set<string>>();
+  for (const [kw, ids] of index) {
+    if (ids.length < 2 || ids.length > maxPer) continue;
+    for (let i = 0; i < ids.length; i++) {
+      for (let j = i + 1; j < ids.length; j++) {
+        const a = ids[i] < ids[j] ? ids[i] : ids[j];
+        const b = ids[i] < ids[j] ? ids[j] : ids[i];
+        const pk = a + ">" + b;
+        if (!pairKw.has(pk)) pairKw.set(pk, new Set());
+        pairKw.get(pk)!.add(kw);
+      }
+    }
+  }
+  const kept = edges.filter((e) => e.kind !== "keyword");
+  const out = [...kept];
+  for (const [pk, kws] of pairKw) {
+    const [a, b] = pk.split(">");
+    out.push({ from: a, to: b, label: [...kws].slice(0, 3).join(", "), kind: "keyword" });
+  }
+  return out;
+}
 
 // Merge a collector result into the running graph: nodes dedupe by id
 // (later collectors enrich earlier fields), edges dedupe by endpoints+label

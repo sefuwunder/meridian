@@ -41,6 +41,17 @@ in the collection panel and the sprint continues. Nothing is ever half-merged �
 nodes dedupe by id, edges dedupe by endpoints + label, and edges pointing at
 missing nodes are dropped.
 
+## Keyword interlinking
+
+Beyond the hub spokes, any two nodes sharing a keyword are connected by a
+dashed edge labeled with the shared word(s) — the music venues cluster, the
+embassies find each other, a headline links to the company it mentions.
+Keywords come from labels, subtypes, and descriptions; city/country names are
+excluded (they'd link everything), stopwords in English/French/Spanish/
+Portuguese are dropped, and a keyword appearing on more than 15 nodes is
+treated as noise. Recomputed from scratch after every source and every analyst
+note, so links never duplicate and labels stay current.
+
 ## Graph interaction
 
 - **Pan / zoom / drag** — drag the background to pan, scroll to zoom, drag any

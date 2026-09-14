@@ -6,7 +6,7 @@ import {
   createRecon, getRecon, listRecons, updateRecon, deleteRecon, fullRecon,
 } from "./db";
 import {
-  SOURCE_DEFS, mergeGraph, collectGeocode, collectOverpass, collectWikipedia,
+  SOURCE_DEFS, mergeGraph, addKeywordEdges, collectGeocode, collectOverpass, collectWikipedia,
   collectBusiness, collectPeople, collectMusic, collectNews,
   collectCountry, collectMoneyTime, collectWeather,
   type Ctx, type GNode, type GEdge, type SourceResult,
@@ -33,6 +33,16 @@ const COLLECTORS: Record<string, (ctx: Ctx) => Promise<SourceResult>> = {
   moneytime: collectMoneyTime,
   weather: collectWeather,
 };
+
+function excludeTokensFor(city: string, country: string | null): string[] {
+  return (city + " " + (country || "")).toLowerCase().split(/[^a-z0-9]+/).filter((t) => t.length >= 3);
+}
+
+// Interlink the graph: any two non-city nodes sharing a keyword get an edge.
+// Recomputed from scratch each pass so labels stay current and never duplicate.
+function interlink(nodes: GNode[], edges: GEdge[], city: string, country: string | null): GEdge[] {
+  return addKeywordEdges(nodes, edges, { excludeTokens: excludeTokensFor(city, country) });
+}
 
 async function runRecon(id: string, city: string, wanted: string[]) {
   if (running.has(id)) return;
@@ -61,6 +71,7 @@ async function runRecon(id: string, city: string, wanted: string[]) {
     const { geo, result } = await collectGeocode(city);
     const ctx: Ctx = { city, ...geo, facts };
     ({ nodes, edges } = mergeGraph({ nodes, edges }, result));
+    edges = interlink(nodes, edges, city, geo.country);
     updateRecon(id, {
       lat: geo.lat, lon: geo.lon, country: geo.country, country_code: geo.countryCode,
     });
@@ -79,6 +90,7 @@ async function runRecon(id: string, city: string, wanted: string[]) {
       try {
         const r = await fn(ctx);
         ({ nodes, edges } = mergeGraph({ nodes, edges }, r));
+        edges = interlink(nodes, edges, city, ctx.country);
         persist();
         setState(d.key, { state: "ok", note: r.note || "", ms: Date.now() - t });
       } catch (e: any) {
@@ -150,6 +162,7 @@ const server = Bun.serve({
           nodes: [node],
           edges: target ? [{ from: nid, to: target, label: "annotates" }] : [],
         });
+        merged.edges = interlink(merged.nodes, merged.edges, f.city, f.country);
         updateRecon(row.id, { nodes_json: JSON.stringify(merged.nodes), edges_json: JSON.stringify(merged.edges) });
         return json({ node }, 201);
       }
