@@ -56,6 +56,14 @@ note, so links never duplicate and labels stay current.
 
 - **Pan / zoom / drag** — drag the background to pan, scroll to zoom, drag any
   node to reposition it (the layout reheats around your move).
+- **Built for scale** — repulsion runs on a spatial hash (not O(n²)), new
+  nodes land on a golden-angle spiral so thousands don't start in one dense
+  disc, the render loop sleeps when the layout settles (zero idle CPU), and
+  physics automatically drops to every other frame if a tick ever exceeds
+  ~24ms — pan/zoom stay fluid while the layout catches up. Node size encodes
+  connectivity: orphans render at 5px, hubs grow to 16px, the city stays
+  dominant at 20px, and well-connected hubs earn labels at overview zoom
+  (zoom in to name everything).
 - **Click a node** — detail panel with type, source, description, outbound link,
   coordinates, and its connections (click through them).
 - **Type chips** — toggle whole categories (places, culture, orgs, people…).

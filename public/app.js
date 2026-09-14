@@ -20,7 +20,7 @@ const S = {
   selected: null, hovered: null,
   typeFilter: new Set(ALL_TYPES),
   search: "",
-  running: true, alpha: 1,
+  running: true, alpha: 1, slowPhys: false,
   dragging: null, panning: null, moved: false,
   pollTimer: null, clockTimer: null,
 };
@@ -32,9 +32,12 @@ const raf = window.requestAnimationFrame || ((fn) => setTimeout(fn, 16));
 
 // ---------------- graph model ----------------
 
+// Well-connected nodes render larger than orphans: orphans sit at 5px,
+// hubs grow to 16px, the city stays dominant at 20.
 function radiusFor(n, degree) {
   if (n.type === "city") return 20;
-  return 7 + Math.min(6, (degree || 0) * 0.9);
+  const base = n.type === "note" ? 7 : n.type === "org" ? 6 : 5;
+  return Math.min(16, base + Math.min(degree || 0, 14) * 0.75);
 }
 
 function syncGraph() {
@@ -50,7 +53,10 @@ function syncGraph() {
       s.r = radiusFor(n, degree[n.id]);
       continue;
     }
-    const a = Math.random() * Math.PI * 2, d = 60 + Math.random() * 220;
+    // golden-angle spiral: new nodes land spread out, so even thousands
+    // of nodes start in distinct grid cells instead of one dense disc
+    const idx = S.sim.size, ga = Math.PI * (3 - Math.sqrt(5));
+    const a = idx * ga, d = 50 + Math.sqrt(idx) * 26;
     const isCity = n.type === "city";
     S.sim.set(n.id, {
       ...n,
@@ -68,7 +74,7 @@ function syncGraph() {
     S.edges.push({ ...e, hidden: false });
     have.add(ekey(e));
   }
-  if (added) { S.alpha = 1; }
+  if (added) { S.alpha = 1; kick(); }
   applyFilters();
   updateCounts();
 }
@@ -97,6 +103,7 @@ function applyFilters() {
   if (S.selected && S.sim.get(S.selected)?.hidden) S.selected = null;
   updateCounts();
   renderChips();
+  draw();
 }
 
 // ---------------- physics ----------------
@@ -108,22 +115,40 @@ function tick() {
   if (!n) return;
   const alpha = S.dragging ? 0.35 : S.alpha;
 
-  // repulsion (n^2 — fine into the low hundreds)
+  // repulsion via spatial hash: identical forces to the old O(n^2) loop,
+  // but each node only tests neighbors in adjacent grid cells (~O(n))
+  const CELL = 180;
+  const grid = new Map();
+  for (let i = 0; i < n; i++) {
+    const p = nodes[i];
+    const gk = Math.floor(p.x / CELL) + ":" + Math.floor(p.y / CELL);
+    let cell = grid.get(gk);
+    if (!cell) grid.set(gk, (cell = []));
+    cell.push(i);
+  }
   for (let i = 0; i < n; i++) {
     const a = nodes[i];
     if (a.pinned) continue;
-    for (let j = i + 1; j < n; j++) {
-      const b = nodes[j];
-      let dx = a.x - b.x, dy = a.y - b.y;
-      let d2 = dx * dx + dy * dy;
-      if (d2 < 0.01) { dx = (Math.random() - 0.5); dy = (Math.random() - 0.5); d2 = 1; }
-      const minD = a.r + b.r + 26;
-      if (d2 > minD * minD * 9) continue;
-      const d = Math.sqrt(d2);
-      const f = Math.min(5200 / d2, 40) * alpha;
-      const fx = (dx / d) * f, fy = (dy / d) * f;
-      a.vx += fx; a.vy += fy;
-      if (!b.pinned) { b.vx -= fx; b.vy -= fy; }
+    const ax = a.x, ay = a.y, ar = a.r;
+    const cx = Math.floor(ax / CELL), cy = Math.floor(ay / CELL);
+    for (let ox = -1; ox <= 1; ox++) for (let oy = -1; oy <= 1; oy++) {
+      const cell = grid.get((cx + ox) + ":" + (cy + oy));
+      if (!cell) continue;
+      for (let ci = 0; ci < cell.length; ci++) {
+        const j = cell[ci];
+        if (j <= i) continue;
+        const b = nodes[j];
+        let dx = ax - b.x, dy = ay - b.y;
+        let d2 = dx * dx + dy * dy;
+        if (d2 < 0.01) { dx = (Math.random() - 0.5); dy = (Math.random() - 0.5); d2 = 1; }
+        const minD = ar + b.r + 26;
+        if (d2 > minD * minD * 9) continue;
+        const d = Math.sqrt(d2);
+        const f = Math.min(5200 / d2, 40) * alpha;
+        const fx = (dx / d) * f, fy = (dy / d) * f;
+        a.vx += fx; a.vy += fy;
+        if (!b.pinned) { b.vx -= fx; b.vy -= fy; }
+      }
     }
   }
   // springs
@@ -182,6 +207,8 @@ function draw() {
     const a = S.sim.get(e.from), b = S.sim.get(e.to);
     if (!a || !b) continue;
     const [ax, ay] = w2s(a.x, a.y), [bx, by] = w2s(b.x, b.y);
+    if ((ax < -80 && bx < -80) || (ax > r.width + 80 && bx > r.width + 80) ||
+        (ay < -60 && by < -60) || (ay > r.height + 60 && by > r.height + 60)) continue;
     const hot = S.selected && (e.from === S.selected || e.to === S.selected);
     const isKw = e.kind === "keyword";
     ctx2d.strokeStyle = hot ? "rgba(240,180,41,0.55)"
@@ -213,7 +240,8 @@ function draw() {
       ctx2d.beginPath(); ctx2d.arc(x, y, rad + 4, 0, Math.PI * 2);
       ctx2d.strokeStyle = "rgba(255,255,255,0.8)"; ctx2d.lineWidth = 1.5; ctx2d.stroke();
     }
-    const showLabel = nd.type === "city" || isSel || isHov || S.view.k >= 0.8 || match;
+    // at overview zoom only well-connected hubs earn a label; zoom in to name everything
+    const showLabel = nd.type === "city" || isSel || isHov || S.view.k >= 1.6 || nd.r >= 10.5 || match;
     if (showLabel) {
       ctx2d.font = (nd.type === "city" ? "700 13px" : "11px") + " -apple-system,Segoe UI,Roboto,sans-serif";
       ctx2d.textAlign = "center";
@@ -226,10 +254,26 @@ function draw() {
   }
 }
 
+// The render loop sleeps when the layout settles: wake() reheats it,
+// kick() ensures it's running. Idle graphs cost zero CPU. When physics
+// itself is heavy (thousands of nodes), it drops to every other frame so
+// pan/zoom/draw stay at full rate while the layout catches up.
+let rafId = 0, physTick = 0, physAvg = 8;
+const nowMs = () => (typeof performance !== "undefined" && performance.now ? performance.now() : Date.now());
+function kick() { if (!rafId && S.running) rafId = raf(loop); }
+function wake() { S.alpha = Math.max(S.alpha, 0.5); kick(); }
 function loop() {
-  if (S.running && (S.alpha > 0 || S.dragging)) tick();
-  draw();
-  raf(loop);
+  rafId = 0;
+  if (S.running && (S.alpha > 0 || S.dragging)) {
+    physTick++;
+    if (!S.slowPhys || physTick % 2 === 1 || S.dragging) {
+      const t0 = nowMs();
+      tick();
+      physAvg = physAvg * 0.9 + (nowMs() - t0) * 0.1;
+      S.slowPhys = physAvg > 24;
+    }
+    draw(); kick();
+  } else draw();
 }
 
 // ---------------- interaction ----------------
@@ -254,6 +298,7 @@ canvas.addEventListener("mousedown", (e) => {
   if (nd) {
     S.dragging = nd;
     S.dragX = px; S.dragY = py;
+    kick();
   } else {
     S.panning = { x: px, y: py, vx: S.view.x, vy: S.view.y };
   }
@@ -270,16 +315,18 @@ window.addEventListener("mousemove", (e) => {
     if (Math.abs(px - S.panning.x) + Math.abs(py - S.panning.y) > 3) S.moved = true;
     S.view.x = S.panning.vx - (px - S.panning.x) / S.view.k;
     S.view.y = S.panning.vy - (py - S.panning.y) / S.view.k;
+    draw();
   } else if (e.target === canvas) {
     const nd = hitNode(px, py);
-    S.hovered = nd ? nd.id : null;
+    const hov = nd ? nd.id : null;
+    if (hov !== S.hovered) { S.hovered = hov; draw(); }
     canvas.classList.toggle("over-node", !!nd);
   }
 });
 window.addEventListener("mouseup", (e) => {
   const wasDrag = S.dragging, wasPan = S.panning;
   if (wasDrag && !S.moved) selectNode(wasDrag.id);
-  if (wasDrag) S.alpha = Math.max(S.alpha, 0.4);
+  if (wasDrag) { S.alpha = Math.max(S.alpha, 0.4); kick(); }
   S.dragging = null; S.panning = null;
   canvas.classList.remove("dragging");
 });
@@ -292,6 +339,7 @@ canvas.addEventListener("wheel", (e) => {
   S.view.x = wx - (px - r.width / 2) / k2;
   S.view.y = wy - (py - r.height / 2) / k2;
   S.view.k = k2;
+  draw();
 }, { passive: false });
 window.addEventListener("resize", resize);
 
@@ -300,6 +348,7 @@ function centerOn(id) {
   if (!nd) return;
   S.view.x = nd.x; S.view.y = nd.y;
   if (S.view.k < 0.9) S.view.k = 0.9;
+  draw();
 }
 function fit() {
   const nodes = visibleNodes();
@@ -313,6 +362,7 @@ function fit() {
   const k = Math.min(2.2, Math.max(0.25, Math.min((r.width - 120) / Math.max(1, x1 - x0), (r.height - 120) / Math.max(1, y1 - y0))));
   S.view.k = k;
   S.view.x = (x0 + x1) / 2; S.view.y = (y0 + y1) / 2;
+  draw();
 }
 
 // ---------------- selection + detail ----------------
@@ -364,6 +414,7 @@ function selectNode(id) {
     }
     el.appendChild(list);
   }
+  draw();
 }
 
 function escapeHtml(s) {
@@ -385,7 +436,7 @@ function renderChips() {
     c.querySelector("span:last-child").textContent = `${TYPE_LABEL[t]} · ${counts[t]}`;
     c.onclick = () => {
       S.typeFilter.has(t) ? S.typeFilter.delete(t) : S.typeFilter.add(t);
-      S.alpha = Math.max(S.alpha, 0.5);
+      wake();
       applyFilters();
     };
     box.appendChild(c);
@@ -564,6 +615,7 @@ $("btnFit").onclick = fit;
 $("btnPause").onclick = (e) => {
   S.running = !S.running;
   e.target.textContent = S.running ? "pause" : "resume";
+  kick();
 };
 $("btnExport").onclick = () => {
   if (S.recon) window.location.href = `/api/recon/${S.recon.id}/export`;
@@ -648,13 +700,13 @@ function boot() {
       if (recons && recons[0]) loadRecon(recons[0].id, true);
     }).catch(() => {});
   });
-  raf(loop);
+  draw(); // initial paint; the loop wakes on data via kick()
 }
 
 if (document.readyState === "loading") document.addEventListener("DOMContentLoaded", boot);
 else boot();
 
 // test seam
-window.__meridian = { S, COLORS, syncGraph, tick, applyFilters, searchNodes, hitNode, centerOn, fit, w2s, s2w, selectNode, radiusFor };
+window.__meridian = { S, COLORS, syncGraph, tick, applyFilters, searchNodes, hitNode, centerOn, fit, w2s, s2w, selectNode, radiusFor, wake, kick, loop };
 
 })();
