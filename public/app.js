@@ -755,6 +755,8 @@ function renderSourceChecks() {
     ["news", "news"], ["country", "country"], ["moneytime", "money+time"], ["weather", "weather"],
     ["gdelt", "events"], ["gleif", "legal entities"], ["opensky", "aircraft"], ["openalex", "research"],
     ["gdacs", "disasters"], ["chronicling", "historic press"],
+    ["icij", "offshore leaks"], ["occrp", "investigations"], ["urlscan", "web scans"],
+    ["nonprofits", "nonprofits"], ["openfec", "campaign finance"],
   ];
   for (const [key, label] of defs) {
     const l = document.createElement("label");

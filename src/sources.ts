@@ -20,6 +20,7 @@ export interface Ctx {
   lat: number; lon: number;
   bbox: { s: number; w: number; n: number; e: number };
   country: string; countryCode: string;
+  state: string | null; // 2-letter US state code when known (powers US-only sources)
   cityId: string;
   facts: Record<string, any>;
 }
@@ -67,8 +68,12 @@ export async function collectGeocode(city: string): Promise<{ geo: any; result: 
   const country = g.address?.country || "";
   const countryCode = (g.address?.country_code || "").toUpperCase();
   const cityId = `city:${slug(g.display_name?.split(",")[0] || city)}`;
+  // US state code (2 letters) when available — powers the US-only sources.
+  const stateRaw = String(g.address?.state_code || g.address?.["ISO3166-2-lvl4"] || "")
+    .split("-").pop()?.toUpperCase() || "";
+  const state = /^[A-Z]{2}$/.test(stateRaw) ? stateRaw : null;
   const geo = {
-    lat, lon, country, countryCode, cityId,
+    lat, lon, country, countryCode, cityId, state,
     bbox: { s: lat - dLat, n: lat + dLat, w: lon - dLon, e: lon + dLon },
   };
   const result: SourceResult = {
@@ -761,6 +766,320 @@ export async function collectChronicling(ctx: Ctx): Promise<SourceResult> {
   };
 }
 
+// ---------- 17. offshore leaks (ICIJ) ----------
+// Reconciliation API, keyless: POST https://offshoreleaks.icij.org/api/v1/reconcile
+// with a batch of { query, type, limit } entries. Response (W3C reconciliation
+// spec v0.2): { "<key>": { "result": [ { id, name, type: [ { id, name } ],
+// score, match, description } ] } }. Covers all five leak namespaces
+// (Panama/Paradise/Pandora/Bahamas/Offshore) through the default endpoint.
+// Parsed defensively — type names map to graph node types; anything else is
+// dropped, never thrown.
+
+const ICIJ_TYPES = ["Entity", "Officer", "Intermediary"] as const;
+
+function icijNodeType(typeName: string): { type: NodeType; subtype: string } {
+  const t = typeName.toLowerCase();
+  if (t.includes("officer")) return { type: "person", subtype: "offshore officer" };
+  if (t.includes("intermediary")) return { type: "org", subtype: "offshore intermediary" };
+  if (t.includes("address")) return { type: "place", subtype: "offshore address" };
+  if (t.includes("other")) return { type: "data", subtype: "offshore other" };
+  return { type: "org", subtype: "offshore entity" };
+}
+
+export async function collectIcig(ctx: Ctx): Promise<SourceResult> {
+  const queries: Record<string, any> = {};
+  ICIJ_TYPES.forEach((t, i) => { queries[`q${i}`] = { query: ctx.city, type: t, limit: 10 }; });
+  const j = await fetchJson(
+    "https://offshoreleaks.icij.org/api/v1/reconcile",
+    { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ queries }) },
+    30000);
+  const nodes: GNode[] = [];
+  const seen = new Set<string>();
+  for (const val of Object.values(j || {})) {
+    const results = Array.isArray((val as any)?.result) ? (val as any).result : [];
+    for (const r of results) {
+      if (!r || typeof r !== "object") continue;
+      const id = String((r as any).id || "").trim();
+      if (!id || seen.has(id)) continue;
+      seen.add(id);
+      const name = String((r as any).name || "").trim() || id;
+      const types = Array.isArray((r as any).type) ? (r as any).type : [];
+      const typeName = String(types[0]?.name || types[0]?.id || "").trim() || "entity";
+      const score = Number((r as any).score);
+      const { type, subtype } = icijNodeType(typeName);
+      nodes.push({
+        id: `icij:${slug(id)}`, label: name.slice(0, 90), type, subtype,
+        source: "icij",
+        detail: [typeName.toLowerCase(),
+          Number.isFinite(score) ? `match ${Math.round(score)}%` : ""].filter(Boolean).join(" · "),
+        url: `https://offshoreleaks.icij.org/nodes/${encodeURIComponent(id)}`,
+      });
+      if (nodes.length >= 15) break;
+    }
+    if (nodes.length >= 15) break;
+  }
+  return {
+    nodes,
+    edges: nodes.map((n) => ({ from: n.id, to: ctx.cityId, label: "offshore link" })),
+    note: `${nodes.length} offshore matches`,
+  };
+}
+
+// ---------- 18. investigative data (OCCRP Aleph) ----------
+// Keyed-free: anonymous search 401s since mid-2026. The key is read from the
+// OCCRP_API_KEY env var — never committed. With no key the collector stays
+// idle (zero nodes, success state, setup hint in the note) and never breaks
+// the sprint. Endpoint shape follows the public Aleph API
+// (Authorization: ApiKey header, /api/2/search?q=, results[] with
+// id/schema/name/caption/properties/collection) — not verified against live
+// traffic from this environment, so parsing is fully defensive.
+
+const OCCRP_HOST = "https://data.occrp.org";
+
+function alephNodeType(schema: string): { type: NodeType; subtype: string } {
+  const s = schema.toLowerCase();
+  if (s.includes("person")) return { type: "person", subtype: "aleph" };
+  if (s.includes("company") || s.includes("legalentity") || s.includes("organization"))
+    return { type: "org", subtype: "aleph" };
+  if (s.includes("contract") || s.includes("procurement")) return { type: "data", subtype: "contract" };
+  if (s.includes("address")) return { type: "place", subtype: "aleph" };
+  if (s.includes("document") || s.includes("email")) return { type: "news", subtype: "document" };
+  return { type: "data", subtype: "aleph" };
+}
+
+export async function collectOccrp(ctx: Ctx): Promise<SourceResult> {
+  const key = (process.env.OCCRP_API_KEY || "").trim();
+  if (!key) {
+    return {
+      nodes: [], edges: [],
+      note: "idle — set the OCCRP_API_KEY env var (free account at data.occrp.org) to activate",
+    };
+  }
+  const j = await fetchJson(
+    `${OCCRP_HOST}/api/2/search?q=${encodeURIComponent(ctx.city)}&limit=25`,
+    { headers: { Authorization: `ApiKey ${key}` } }, 30000);
+  const results = Array.isArray(j?.results) ? j.results : [];
+  const nodes: GNode[] = [];
+  const seen = new Set<string>();
+  for (const r of results.slice(0, 15)) {
+    if (!r || typeof r !== "object") continue;
+    const id = String(r.id || "").trim();
+    if (!id || seen.has(id)) continue;
+    seen.add(id);
+    const name = String(r.name || r.caption || "").trim() || id;
+    const schema = String(r.schema || "");
+    const props = r.properties && typeof r.properties === "object" ? r.properties : {};
+    const propStr = (k: string) => Array.isArray(props[k]) ? props[k].map(String).slice(0, 2).join(", ") : "";
+    const { type, subtype } = alephNodeType(schema);
+    const coll = typeof r.collection === "object" ? String(r.collection?.label || "") : "";
+    nodes.push({
+      id: `aleph:${slug(id)}`, label: name.slice(0, 90), type, subtype,
+      source: "occrp",
+      detail: [coll, propStr("country"), propStr("address")].filter(Boolean).join(" · ").slice(0, 200),
+      url: `${OCCRP_HOST}/entities/${encodeURIComponent(id)}`,
+    });
+  }
+  return {
+    nodes,
+    edges: nodes.map((n) => ({ from: n.id, to: ctx.cityId, label: "in archive" })),
+    note: `${nodes.length} OCCRP entities`,
+  };
+}
+
+// ---------- 19. web scans (urlscan.io) ----------
+// Keyless anonymous search: GET https://urlscan.io/api/v1/search/?q=...&size=.
+// Anonymous quota is ~30 search requests/min per IP — one request per recon.
+// Response: { total, results: [ { _id, page: { domain, url, ip, country,
+// server, asn }, task: { url, time, visibility }, verdicts: { overall:
+// { score, malicious } } } ] }. A 429 is a hard stop for this run (thrown,
+// never retried); properties may be missing and are handled gracefully.
+
+function throwIfRateLimited(e: any, src: string): never {
+  if (/HTTP 429/.test(String(e?.message || "")))
+    throw new Error(`${src}: rate-limited (HTTP 429) — paused for this run`);
+  throw e;
+}
+
+export async function collectUrlscan(ctx: Ctx): Promise<SourceResult> {
+  const token = ctx.city.toLowerCase().replace(/[^a-z0-9]/g, "");
+  if (!token) throw new Error("urlscan: empty city token");
+  let j: any;
+  try {
+    j = await fetchJson(
+      `https://urlscan.io/api/v1/search/?q=${encodeURIComponent(`page.url:*${token}*`)}&size=25`,
+      {}, 25000);
+  } catch (e) { throwIfRateLimited(e, "urlscan"); }
+  const results = Array.isArray(j?.results) ? j.results : [];
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  for (const r of results.slice(0, 8)) {
+    if (!r || typeof r !== "object") continue;
+    const page = r.page && typeof r.page === "object" ? r.page : {};
+    const verdicts = r.verdicts && typeof r.verdicts === "object" ? r.verdicts : {};
+    const domain = String(page.domain || "").trim().toLowerCase();
+    if (!domain || seen.has(`d:${domain}`)) continue;
+    seen.add(`d:${domain}`);
+    const did = `urlscan:domain:${slug(domain)}`;
+    const scanId = String(r._id || "").trim();
+    const v = verdicts.overall && typeof verdicts.overall === "object" ? verdicts.overall : {};
+    const malicious = v.malicious === true ? "flagged malicious" : "";
+    nodes.push({
+      id: did, label: domain.slice(0, 60), type: "infra" as NodeType, subtype: "domain",
+      source: "urlscan",
+      detail: [String(page.country || "").toUpperCase(), String(page.server || ""),
+        String(page.asn || ""), malicious].filter(Boolean).join(" · "),
+      url: scanId ? `https://urlscan.io/result/${scanId}/` : (String(page.url || "") || undefined),
+    });
+    edges.push({ from: did, to: ctx.cityId, label: "scanned" });
+    const ip = String(page.ip || "").trim();
+    if (ip && !seen.has(`i:${ip}`)) {
+      seen.add(`i:${ip}`);
+      const iid = `urlscan:ip:${slug(ip)}`;
+      nodes.push({
+        id: iid, label: ip, type: "infra" as NodeType, subtype: "ip",
+        source: "urlscan", detail: "resolved by urlscan",
+      });
+      edges.push({ from: iid, to: did, label: "resolves" });
+      const asn = String(page.asn || "").trim();
+      if (asn && !seen.has(`a:${asn}`)) {
+        seen.add(`a:${asn}`);
+        const aid = `urlscan:asn:${slug(asn)}`;
+        nodes.push({
+          id: aid, label: asn.slice(0, 60), type: "infra" as NodeType, subtype: "asn",
+          source: "urlscan", detail: "autonomous system",
+        });
+        edges.push({ from: aid, to: iid, label: "routes" });
+      }
+    }
+    if (nodes.length >= 24) break;
+  }
+  return { nodes, edges, note: `${nodes.length} scan artifacts` };
+}
+
+// ---------- 20. nonprofits (ProPublica Nonprofit Explorer) ----------
+// Keyless: GET https://projects.propublica.org/nonprofits/api/v2/search.json
+// ?q=<city>&per_page=25. The q param searches name, alternate name, and city,
+// so results are filtered client-side on the org's own city field matching
+// the recon city (case-insensitive) — non-matching orgs are dropped. One
+// request per recon. Response: { organizations: [ { ein, name, city, state,
+// ntee_code, subseccd, guidestar_url, nccs_url } ], total_results }.
+
+const NTEE_LABEL: Record<string, string> = {
+  "1": "arts", "2": "education", "3": "environment", "4": "health",
+  "5": "human services", "6": "international", "7": "public benefit",
+  "8": "religion", "9": "mutual benefit", "10": "unclassified",
+};
+
+export async function collectNonprofits(ctx: Ctx): Promise<SourceResult> {
+  const j = await fetchJson(
+    `https://projects.propublica.org/nonprofits/api/v2/search.json` +
+    `?q=${encodeURIComponent(ctx.city)}&per_page=25`, {}, 25000);
+  const orgs = Array.isArray(j?.organizations) ? j.organizations : [];
+  const want = ctx.city.toLowerCase();
+  const nodes: GNode[] = [];
+  const seen = new Set<string>();
+  for (const o of orgs) {
+    if (!o || typeof o !== "object") continue;
+    const ein = String(o.ein || "").trim();
+    const name = String(o.name || "").trim();
+    const ocity = String(o.city || "").trim().toLowerCase();
+    if (!name || !ein || seen.has(ein)) continue;
+    if (ocity !== want) continue; // keep only orgs actually based in the recon city
+    seen.add(ein);
+    const sub = o.subseccd != null ? `501(c)(${o.subseccd})` : "";
+    const ntee = NTEE_LABEL[String(o.ntee_code || "")] || "";
+    nodes.push({
+      id: `npe:${ein}`, label: name.slice(0, 90), type: "org" as NodeType, subtype: "nonprofit",
+      source: "nonprofits",
+      detail: [String(o.city || ""), String(o.state || ""), sub, ntee].filter(Boolean).join(" · "),
+      url: String(o.guidestar_url || o.nccs_url || "") || undefined,
+    });
+    if (nodes.length >= 12) break;
+  }
+  return {
+    nodes,
+    edges: nodes.map((n) => ({ from: n.id, to: ctx.cityId, label: "based in" })),
+    note: nodes.length ? `${nodes.length} nonprofits` : "no nonprofits matched the city",
+  };
+}
+
+// ---------- 21. campaign finance (OpenFEC) ----------
+// Keyed-free: DEMO_KEY works keyless at 30 req/hr; a personal free key via
+// the OPENFEC_API_KEY env var raises it to 1,000/hr. Two sequential requests
+// per recon, well inside either quota. US-only (state filter required), so
+// non-US cities or an unknown state skip cleanly with zero nodes.
+// Endpoints (public OpenFEC v1 API): /committee/?state=&per_page=,
+// /schedules/schedule_a/?state=&per_page= (itemized receipts with
+// contributor_name/city/occupation/amount). Parsed defensively.
+
+const FEC_BASE = "https://api.open.fec.gov/v1";
+
+function fecMoney(n: any): string {
+  const v = Number(n);
+  if (!Number.isFinite(v)) return "";
+  return v >= 1000 ? `$${(v / 1000).toFixed(1)}k` : `$${Math.round(v)}`;
+}
+
+export async function collectOpenfec(ctx: Ctx): Promise<SourceResult> {
+  if (ctx.countryCode !== "US") {
+    return { nodes: [], edges: [], note: "US dataset — skipped (city outside the US)" };
+  }
+  if (!ctx.state) {
+    return { nodes: [], edges: [], note: "skipped — US state not resolved from geocode" };
+  }
+  const key = (process.env.OPENFEC_API_KEY || "").trim() || "DEMO_KEY";
+  const get = async (path: string): Promise<any> => {
+    try {
+      return await fetchJson(`${FEC_BASE}${path}${path.includes("?") ? "&" : "?"}api_key=${key}`, {}, 25000);
+    } catch (e) { throwIfRateLimited(e, "openfec"); }
+  };
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seenC = new Set<string>();
+  const comms = await get(`/committee/?state=${ctx.state}&per_page=20`);
+  for (const c of (Array.isArray(comms?.results) ? comms.results : []).slice(0, 12)) {
+    if (!c || typeof c !== "object") continue;
+    const cid = String(c.committee_id || "").trim();
+    if (!cid || seenC.has(cid)) continue;
+    seenC.add(cid);
+    const name = String(c.name || "").trim() || cid;
+    nodes.push({
+      id: `fec:committee:${slug(cid)}`, label: name.slice(0, 90),
+      type: "org" as NodeType, subtype: "campaign committee", source: "openfec",
+      detail: [String(c.committee_type_full || c.committee_type || ""),
+        String(c.party_full || ""), String(c.treasurer_name || "") && `treasurer ${c.treasurer_name}`]
+        .filter(Boolean).join(" · ").slice(0, 200),
+      url: `https://www.fec.gov/data/committee/${encodeURIComponent(cid)}/`,
+    });
+  }
+  const sched = await get(`/schedules/schedule_a/?state=${ctx.state}&per_page=15`);
+  const seenD = new Set<string>();
+  const cById = new Map(nodes.filter((n) => n.id.startsWith("fec:committee:"))
+    .map((n) => [n.id.replace("fec:committee:", ""), n.id]));
+  for (const r of (Array.isArray(sched?.results) ? sched.results : []).slice(0, 15)) {
+    if (!r || typeof r !== "object") continue;
+    const dname = String(r.contributor_name || "").trim();
+    if (!dname || seenD.has(dname.toLowerCase())) continue;
+    seenD.add(dname.toLowerCase());
+    const did = `fec:donor:${slug(dname)}`;
+    const com = r.committee && typeof r.committee === "object" ? r.committee : {};
+    const cid = slug(String(com.committee_id || ""));
+    nodes.push({
+      id: did, label: dname.slice(0, 90), type: "person" as NodeType, subtype: "donor",
+      source: "openfec",
+      detail: [String(r.contributor_city || ""), String(r.contributor_state || ""),
+        String(r.contributor_occupation || ""),
+        fecMoney(r.contribution_receipt_amount)].filter(Boolean).join(" · "),
+    });
+    if (cid && cById.has(cid)) edges.push({ from: did, to: cById.get(cid)!, label: "donated to" });
+  }
+  return {
+    nodes,
+    edges: [...edges, ...nodes.filter((n) => n.type === "org")
+      .map((n) => ({ from: n.id, to: ctx.cityId, label: "in" }))],
+    note: `${nodes.length} committees & donors`,
+  };
+}
+
 export const SOURCE_DEFS = [
   { key: "geocode", label: "Geocode · OpenStreetMap" },
   { key: "overpass", label: "Places · OpenStreetMap" },
@@ -778,6 +1097,11 @@ export const SOURCE_DEFS = [
   { key: "openalex", label: "Research · OpenAlex" },
   { key: "gdacs", label: "Disasters · GDACS" },
   { key: "chronicling", label: "Historic press · Library of Congress" },
+  { key: "icij", label: "Offshore leaks · ICIJ" },
+  { key: "occrp", label: "Investigations · OCCRP Aleph" },
+  { key: "urlscan", label: "Web scans · urlscan.io" },
+  { key: "nonprofits", label: "Nonprofits · ProPublica" },
+  { key: "openfec", label: "Campaign finance · OpenFEC" },
 ];
 
 // ---------- keyword interlinking ----------

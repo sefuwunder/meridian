@@ -3,11 +3,14 @@
 Land in a foreign city, launch a recon sprint, and watch social, cultural, and
 business intel assemble itself into an interactive web of connected nodes.
 
-`meridian` collects from **fourteen free, keyless sources** and lays the results out
-as a force-directed node graph: the city sits pinned at the hub, everything
-else — restaurants, museums, coworking spaces, embassies, hospitals, companies,
-legal entities, notable people, researchers, artists, headlines, live aircraft,
-currency, weather, local time — orbits it, connected by labeled edges.
+`meridian` collects from **nineteen free, keyless sources** plus two optional
+keyed-free ones (OCCRP Aleph needs a free API key to activate; OpenFEC works
+out of the box on a low demo quota and accepts a free personal key for the
+full rate). It lays the results out as a force-directed node graph: the city
+sits pinned at the hub, everything else — restaurants, museums, coworking
+spaces, embassies, hospitals, companies, legal entities, notable people,
+researchers, artists, headlines, live aircraft, currency, weather, local
+time — orbits it, connected by labeled edges.
 
 ## Run it
 
@@ -15,6 +18,13 @@ currency, weather, local time — orbits it, connected by labeled edges.
 bun install   # nothing to install — zero dependencies
 bun src/server.ts
 # → http://localhost:3005
+```
+
+Optional keys (never committed; read from environment):
+
+```bash
+OCCRP_API_KEY=...    # free account at data.occrp.org — activates the OCCRP Aleph collector
+OPENFEC_API_KEY=...  # free personal key at api.open.fec.gov — raises OpenFEC from 30/hr to 1,000/hr
 ```
 
 Type a city, tick the sources you want, hit **launch recon**. Collection runs in
@@ -41,6 +51,11 @@ the header tracks elapsed time.
 | 14 | OpenAlex (CC0) | research institutions + notable affiliated authors |
 | 15 | GDACS | disaster alerts (earthquake, cyclone, flood, volcano, drought, wildfire) from the last 90 days, filtered to events in the recon's country or within ~250 km of the city; nodes carry alert level, event type, date, and report link. Keyless, free with attribution. |
 | 16 | Library of Congress Chronicling America | historic US newspaper pages (1770–1963) mentioning the city: newspaper title, place of publication, date, link to the LOC page. Keyless, US public domain. One query per recon (~10 req/min guideline); non-US cities skip cleanly. |
+| 17 | ICIJ Offshore Leaks | keyless reconciliation API: entities, officers, and intermediaries matching the city across all five leak namespaces (Panama/Paradise/Pandora/Bahamas/Offshore), with match scores and node links. |
+| 18 | OCCRP Aleph | entity search across 300+ investigative datasets (company registries, procurement, sanctions, leaks) on the Follow-the-Money model. Keyed-free: stays idle with a setup hint until `OCCRP_API_KEY` is set; never blocks the sprint. |
+| 19 | urlscan.io | keyless search API: recent public web scans whose page URL mentions the city, expanded into domain → IP → ASN infra nodes with scan links and malicious-verdict flags. One request per recon (~30/min anonymous quota); HTTP 429 ends the source for the run, never retried. |
+| 20 | ProPublica Nonprofit Explorer v2 | keyless: IRS nonprofits actually based in the recon city (filtered on the org's city field), with NTEE category and 501(c) subsection. One request per recon. |
+| 21 | OpenFEC | keyed-free: campaign committees in the recon's US state plus itemized donors → person→committee "donated to" edges. Works on the built-in demo key at 30 req/hr; `OPENFEC_API_KEY` raises the limit. Two requests per recon. |
 
 Every source is best-effort and independent: one dead API marks its row failed
 in the collection panel and the sprint continues. Nothing is ever half-merged —
