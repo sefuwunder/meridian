@@ -33,6 +33,9 @@ const SEL_RING = "#f0b429";
 const NODE_OUTLINE = {};
 for (const t of ALL_TYPES) NODE_OUTLINE[t] = shade(COLORS[t], 0.45);
 const KW_DASH = [4, 5]; // one shared array; setLineDash copies the pattern
+const GROUP_BOX = "#0e1730";   // expanded group container, solid (no alpha per perf rules)
+const GROUP_RING = "#33436e";  // group container outline
+const GROUP_BUBBLE = "#16224a";// collapsed group bubble fill
 const FONT = "11px -apple-system,Segoe UI,Roboto,sans-serif";
 const FONT_CITY = "700 13px -apple-system,Segoe UI,Roboto,sans-serif";
 const LABEL_MAX = 24; // canvas labels truncated past this length
@@ -40,11 +43,58 @@ function truncLabel(s) {
   s = s || "";
   return s.length > LABEL_MAX ? s.slice(0, LABEL_MAX - 1) + "…" : s;
 }
+function roundRectPath(c, x, y, w, h, r) {
+  c.beginPath();
+  c.moveTo(x + r, y);
+  c.arcTo(x + w, y, x + w, y + h, r);
+  c.arcTo(x + w, y + h, x, y + h, r);
+  c.arcTo(x, y + h, x, y, r);
+  c.arcTo(x, y, x + w, y, r);
+  c.closePath();
+}
+
+// Group layout geometry from live sim positions (world coords). Used by the
+// draw pass and exposed for tests; the screen transform happens in draw().
+function groupBoxes() {
+  const out = [];
+  for (const g of S.groups) {
+    // collapsed groups keep their members' last known positions for the bubble,
+    // so hidden members still count toward the geometry
+    const members = g.members.map((id) => S.sim.get(id)).filter((n) => n && (g.collapsed || !n.hidden));
+    if (!members.length) continue;
+    let x0 = 1e18, y0 = 1e18, x1 = -1e18, y1 = -1e18, cx = 0, cy = 0;
+    for (const m of members) {
+      x0 = Math.min(x0, m.x - m.r); y0 = Math.min(y0, m.y - m.r);
+      x1 = Math.max(x1, m.x + m.r); y1 = Math.max(y1, m.y + m.r);
+      cx += m.x; cy += m.y;
+    }
+    out.push({
+      gid: g.id, name: g.name, collapsed: g.collapsed,
+      x0, y0, x1, y1, cx: cx / members.length, cy: cy / members.length,
+      count: members.length,
+    });
+  }
+  return out;
+}
+function hitGroup(px, py) {
+  for (const b of (S._bubbles || [])) {
+    const dx = b.x - px, dy = b.y - py;
+    if (dx * dx + dy * dy <= b.r * b.r) return b.gid;
+  }
+  return null;
+}
 
 const S = {
   recon: null,
   sim: new Map(),       // id -> {id,label,type,...,x,y,vx,vy,r,hidden,pinned}
   edges: [],            // {from,to,label,hidden}
+  groups: [],           // {id,name,members:[node ids],collapsed} — persisted in case files
+  multi: new Set(),     // multi-selected node ids (shift-click / shift-drag)
+  docKind: "recon",     // "recon" | "case"
+  caseId: null, caseName: "",
+  dirty: false,         // unsaved merges/groups/edits — save to a case file
+  marquee: null,        // {x0,y0,x1,y1} screen-space shift-drag rect
+  _bubbles: [],         // collapsed-group hit targets, refreshed each draw
   view: { x: 0, y: 0, k: 1 },
   selected: null, hovered: null,
   typeFilter: new Set(ALL_TYPES),
@@ -119,12 +169,14 @@ function visibleEdges() {
 
 function applyFilters() {
   const q = S.search.trim().toLowerCase();
+  const collapsedIds = new Set();
+  for (const g of S.groups) if (g.collapsed) for (const id of g.members) collapsedIds.add(id);
   for (const n of S.sim.values()) {
     const typeHidden = !S.typeFilter.has(n.type);
     const queryHidden = Boolean(q &&
       !(n.label || "").toLowerCase().includes(q) &&
       !(n.subtype || "").toLowerCase().includes(q));
-    n.hidden = typeHidden || queryHidden;
+    n.hidden = typeHidden || queryHidden || collapsedIds.has(n.id);
   }
   const hiddenIds = new Set();
   for (const n of S.sim.values()) if (n.hidden) hiddenIds.add(n.id);
@@ -261,6 +313,39 @@ function draw() {
   strokePass(isKw, EDGE_KW_SOLID, KW_DASH);
   strokePass(isHot, EDGE_HOT_SOLID, null);
 
+  // ---- groups: expanded groups get a labeled container behind their
+  // members; collapsed groups render as one bubble at the member centroid.
+  // Solid colors only, matching the frame-loop perf rules.
+  S._bubbles = [];
+  for (const gb of groupBoxes()) {
+    if (gb.collapsed) {
+      const sx = (gb.cx - vx) * k + ox, sy = (gb.cy - vy) * k + oy;
+      if (sx < -80 || sy < -80 || sx > W + 80 || sy > H + 80) continue;
+      const br = Math.max(20, 12 + Math.min(gb.count, 20));
+      S._bubbles.push({ gid: gb.gid, x: sx, y: sy, r: br + 6 });
+      c.beginPath(); c.arc(sx, sy, br, 0, Math.PI * 2);
+      c.fillStyle = GROUP_BUBBLE; c.fill();
+      const gsel = sel === "group:" + gb.gid;
+      c.lineWidth = gsel ? 3 : 1.5;
+      c.strokeStyle = gsel ? "#ffffff" : GROUP_RING;
+      c.stroke();
+      const txt = truncLabel(gb.name) + " · " + gb.count;
+      c.font = FONT; c.textAlign = "center"; c.lineWidth = 3; c.strokeStyle = LABEL_HALO;
+      c.strokeText(txt, sx, sy + 4);
+      c.fillStyle = LABEL_FILL; c.fillText(txt, sx, sy + 4);
+    } else {
+      const pad = 30 / k + 14;
+      const sx0 = (gb.x0 - pad - vx) * k + ox, sy0 = (gb.y0 - pad - vy) * k + oy;
+      const sx1 = (gb.x1 + pad - vx) * k + ox, sy1 = (gb.y1 + pad - vy) * k + oy;
+      roundRectPath(c, sx0, sy0, sx1 - sx0, sy1 - sy0, 12);
+      c.fillStyle = GROUP_BOX; c.fill();
+      c.lineWidth = 1.5; c.strokeStyle = GROUP_RING; c.stroke();
+      c.font = FONT; c.textAlign = "left"; c.lineWidth = 3; c.strokeStyle = LABEL_HALO;
+      c.strokeText(truncLabel(gb.name), sx0 + 10, sy0 + 20);
+      c.fillStyle = LABEL_FILL; c.fillText(truncLabel(gb.name), sx0 + 10, sy0 + 20);
+    }
+  }
+
   // ---- nodes: one fill + one stroke per type (was: per node).
   // No shadowBlur anywhere — selected / hovered / city nodes get solid
   // rings instead, and search matches keep their light ring.
@@ -284,6 +369,7 @@ function draw() {
       const match = q && (nd.label || "").toLowerCase().includes(q);
       if (match && !isSel) rings.push([x, y, rad + 4, MATCH_RING, 1.5]);
       if (isSel) rings.push([x, y, rad, "#ffffff", 3]);
+      else if (S.multi.has(nd.id)) rings.push([x, y, rad + 4, SEL_RING, 2]);
       else if (isHov) rings.push([x, y, rad + 4, SEL_RING, 2]);
       else if (t === "city") rings.push([x, y, rad + 5, SEL_RING, 2]);
       // at overview zoom only well-connected hubs earn a label; zoom in to name everything
@@ -360,6 +446,16 @@ function hitNode(px, py) {
 canvas.addEventListener("mousedown", (e) => {
   const r = canvas.getBoundingClientRect();
   const px = e.clientX - r.left, py = e.clientY - r.top;
+  if (e.shiftKey) {
+    // multi-select: shift-click toggles a node, shift-drag marquees
+    const gid = hitGroup(px, py);
+    const nd = gid ? null : hitNode(px, py);
+    if (nd) { toggleMulti(nd.id); S.moved = true; return; }
+    S.marquee = { x0: px, y0: py, x1: px, y1: py };
+    $("marquee").hidden = false;
+    positionMarquee();
+    return;
+  }
   const nd = hitNode(px, py);
   S.moved = false;
   if (nd) {
@@ -367,6 +463,8 @@ canvas.addEventListener("mousedown", (e) => {
     S.dragX = px; S.dragY = py;
     kick();
   } else {
+    const gid = hitGroup(px, py);
+    if (gid) { selectNode("group:" + gid); S.moved = true; return; }
     S.panning = { x: px, y: py, vx: S.view.x, vy: S.view.y };
   }
   canvas.classList.add("dragging");
@@ -374,6 +472,11 @@ canvas.addEventListener("mousedown", (e) => {
 window.addEventListener("mousemove", (e) => {
   const r = canvas.getBoundingClientRect();
   const px = e.clientX - r.left, py = e.clientY - r.top;
+  if (S.marquee) {
+    S.marquee.x1 = px; S.marquee.y1 = py;
+    positionMarquee();
+    return;
+  }
   if (S.dragging) {
     const [wx, wy] = s2w(px, py);
     S.dragging.x = wx; S.dragging.y = wy;
@@ -392,8 +495,17 @@ window.addEventListener("mousemove", (e) => {
 });
 window.addEventListener("mouseup", (e) => {
   const wasDrag = S.dragging, wasPan = S.panning;
+  if (S.marquee) {
+    const m = S.marquee;
+    S.marquee = null;
+    $("marquee").hidden = true;
+    marqueeSelect(m);
+    draw();
+    return;
+  }
   if (wasDrag && !S.moved) selectNode(wasDrag.id);
   if (wasDrag) { S.alpha = Math.max(S.alpha, 0.4); kick(); }
+  if (wasPan && !S.moved && S.multi.size) clearMulti(); // empty click clears the selection
   S.dragging = null; S.panning = null;
   canvas.classList.remove("dragging");
 });
@@ -432,6 +544,85 @@ function fit() {
   draw();
 }
 
+// ---------------- multi-select / dirty state ----------------
+
+function toggleMulti(id) {
+  if (S.multi.has(id)) S.multi.delete(id);
+  else S.multi.add(id);
+  updateSelBar();
+  draw();
+}
+function clearMulti() {
+  S.multi.clear();
+  updateSelBar();
+  draw();
+}
+function updateSelBar() {
+  const bar = $("selBar");
+  const n = S.multi.size;
+  bar.hidden = n === 0;
+  if (!n) return;
+  $("selCount").textContent = n + " selected";
+  const bm = $("btnMerge");
+  bm.disabled = n < 2;
+  bm.textContent = n >= 2 ? `merge ${n} nodes` : "merge";
+}
+function positionMarquee() {
+  const m = S.marquee, el = $("marquee");
+  if (!m || !el) return;
+  el.style.left = Math.min(m.x0, m.x1) + "px";
+  el.style.top = Math.min(m.y0, m.y1) + "px";
+  el.style.width = Math.abs(m.x1 - m.x0) + "px";
+  el.style.height = Math.abs(m.y1 - m.y0) + "px";
+}
+function marqueeSelect(m) {
+  const x0 = Math.min(m.x0, m.x1), x1 = Math.max(m.x0, m.x1);
+  const y0 = Math.min(m.y0, m.y1), y1 = Math.max(m.y0, m.y1);
+  if (x1 - x0 < 6 && y1 - y0 < 6) return;
+  for (const nd of visibleNodes()) {
+    const [sx, sy] = w2s(nd.x, nd.y);
+    if (sx >= x0 && sx <= x1 && sy >= y0 && sy <= y1) S.multi.add(nd.id);
+  }
+  updateSelBar();
+}
+
+// Any merge/group/edit marks the view dirty: the case file (or a fresh save)
+// is the durable layer, so the title carries an unsaved-changes dot.
+function markDirty() {
+  if (!S.dirty) { S.dirty = true; renderTitle(); }
+}
+function renderTitle() {
+  let t;
+  if (S.docKind === "case") t = "📁 " + (S.caseName || "case");
+  else if (S.recon) t = `${S.recon.city}${S.recon.country ? " · " + S.recon.country : ""} — ${S.recon.status}`;
+  else t = "no recon loaded";
+  if (S.dirty) t += " ●";
+  $("reconTitle").textContent = t;
+  $("reconTitle").title = S.dirty ? "unsaved changes — save to a case file" : "";
+}
+
+// Rebuild the sim from the working document after a merge/graph-merge:
+// drop absorbed nodes, union edges, and let syncGraph place the newcomers
+// on the golden-angle spiral. Group memberships and selections are pruned
+// to surviving ids.
+function resyncFromDoc() {
+  const keep = new Set(S.recon.nodes.map((n) => n.id));
+  for (const id of [...S.sim.keys()]) if (!keep.has(id)) S.sim.delete(id);
+  const ekey = (e) => e.from + ">" + e.to + ":" + e.label;
+  const valid = new Set(S.recon.edges.map(ekey));
+  S.edges = S.edges.filter((e) => keep.has(e.from) && keep.has(e.to) && valid.has(ekey(e)));
+  S.groups = S.groups
+    .map((g) => ({ ...g, members: g.members.filter((id) => keep.has(id)) }))
+    .filter((g) => g.members.length > 0);
+  S.multi = new Set([...S.multi].filter((id) => keep.has(id)));
+  if (S.selected && !keep.has(S.selected) && !String(S.selected).startsWith("group:")) S.selected = null;
+  if (S.selected && String(S.selected).startsWith("group:") &&
+      !S.groups.some((g) => g.id === S.selected.slice(6))) S.selected = null;
+  syncGraph();
+  renderGroups();
+  updateSelBar();
+}
+
 // ---------------- selection + detail ----------------
 
 function neighborsOf(id) {
@@ -446,9 +637,10 @@ function neighborsOf(id) {
 
 function selectNode(id) {
   S.selected = id;
-  const nd = S.sim.get(id);
   const el = $("nodeDetail");
-  if (!nd) { el.innerHTML = '<div class="empty">click any node in the web</div>'; return; }
+  if (id && String(id).startsWith("group:")) { renderGroupDetail(String(id).slice(6)); draw(); return; }
+  if (!id || !S.sim.get(id)) { el.innerHTML = '<div class="empty">click any node in the web</div>'; return; }
+  const nd = S.sim.get(id);
   const nb = neighborsOf(id).filter((x) => !x.node.hidden).slice(0, 40);
   const color = COLORS[nd.type] || "#fff";
   el.innerHTML = "";
@@ -464,6 +656,22 @@ function selectNode(id) {
     `<div class="kv">source · <b>${escapeHtml(nd.source || "—")}</b></div>` +
     (nd.lat != null ? `<div class="kv">${Number(nd.lat).toFixed(4)}, ${Number(nd.lon).toFixed(4)}</div>` : "");
   el.appendChild(meta);
+  const inGroups = S.groups.filter((g) => g.members.includes(id));
+  if (inGroups.length) {
+    const gw = document.createElement("div");
+    gw.className = "kv";
+    gw.style.marginTop = "6px";
+    gw.appendChild(document.createTextNode("in group · "));
+    for (const g of inGroups) {
+      const b = document.createElement("button");
+      b.className = "linklike";
+      b.textContent = g.name;
+      b.onclick = () => selectNode("group:" + g.id);
+      gw.appendChild(b);
+      gw.appendChild(document.createTextNode(" "));
+    }
+    el.appendChild(gw);
+  }
   if (nd.detail) { const b = document.createElement("div"); b.className = "body"; b.textContent = nd.detail; el.appendChild(b); }
   if (nd.url) { const a = document.createElement("a"); a.href = nd.url; a.target = "_blank"; a.rel = "noopener"; a.textContent = nd.url; el.appendChild(a); }
   // directed deep search: keywords from this node's content -> new nodes grafted on
@@ -477,11 +685,25 @@ function selectNode(id) {
     dsBtn.disabled = true;
     dsBtn.textContent = "searching…";
     try {
-      await api(`/api/recon/${S.recon.id}/deep-search`, {
-        method: "POST", body: JSON.stringify({ nodeId: id }),
-      });
-      await loadRecon(S.recon.id); // incremental re-sync via syncGraph
-      selectNode(id); // refresh the panel → "deep search again"
+      if (S.docKind === "case") {
+        // case views graft into the working document, not the recon store
+        const r = await api("/api/graph/deep-search", {
+          method: "POST",
+          body: JSON.stringify({
+            nodeId: id, nodes: S.recon.nodes, edges: S.recon.edges,
+            city: S.recon.city, country: S.recon.country || null,
+          }),
+        });
+        S.recon.nodes = r.nodes; S.recon.edges = r.edges;
+        resyncFromDoc(); markDirty();
+        selectNode(id);
+      } else {
+        await api(`/api/recon/${S.recon.id}/deep-search`, {
+          method: "POST", body: JSON.stringify({ nodeId: id }),
+        });
+        await loadRecon(S.recon.id); // incremental re-sync via syncGraph
+        selectNode(id); // refresh the panel → "deep search again"
+      }
     } catch (e) {
       alert("deep search failed: " + e.message);
       dsBtn.disabled = false;
@@ -603,7 +825,7 @@ async function loadList() {
         e.stopPropagation();
         if (!confirm(`delete recon "${rc.city}"?`)) return;
         await api(`/api/recon/${rc.id}`, { method: "DELETE" });
-        if (S.recon && S.recon.id === rc.id) { S.recon = null; S.sim.clear(); S.edges = []; S.selected = null; $("reconTitle").textContent = "no recon loaded"; selectNode(null); }
+        if (S.recon && S.recon.id === rc.id) { S.recon = null; S.sim.clear(); S.edges = []; S.selected = null; S.groups = []; S.multi.clear(); S.dirty = false; renderTitle(); renderGroups(); updateSelBar(); selectNode(null); }
         loadList(); updateCounts();
       };
       li.onclick = () => loadRecon(rc.id);
@@ -683,11 +905,14 @@ async function loadRecon(id, poll) {
       S.sim.clear(); S.edges = []; S.selected = null;
       S.view = { x: 0, y: 0, k: 1 };
       S.typeFilter = new Set(ALL_TYPES);
+      S.groups = []; S.multi.clear();
+      S.docKind = "recon"; S.caseId = null; S.caseName = ""; S.dirty = false;
+      renderGroups(); updateSelBar();
       selectNode(null);
     }
     syncGraph();
     const cityNode = recon.nodes.find((n) => n.type === "city");
-    $("reconTitle").textContent = `${recon.city}${recon.country ? " · " + recon.country : ""} — ${recon.status}`;
+    renderTitle();
     renderDossier(recon.facts || {}, cityNode);
     renderSources(recon.sources || [], recon.progress || {});
     if (recon.status === "collecting") $("collectPanel").hidden = false;
@@ -698,6 +923,277 @@ async function loadRecon(id, poll) {
     }
     if (isNew) setTimeout(fit, 600);
   } catch { /* ignore */ }
+}
+
+// ---------------- groups ----------------
+
+function renderGroupDetail(gid) {
+  const g = S.groups.find((x) => x.id === gid);
+  const el = $("nodeDetail");
+  if (!g) { el.innerHTML = '<div class="empty">group gone</div>'; return; }
+  el.innerHTML = "";
+  const head = document.createElement("div"); head.className = "np";
+  head.innerHTML = `<h4></h4><span class="pill">group · ${g.members.length}</span>`;
+  head.querySelector("h4").textContent = g.name;
+  el.appendChild(head);
+  const t = document.createElement("div"); t.className = "kv";
+  t.textContent = g.collapsed ? "collapsed — members hidden from the graph" : "expanded";
+  el.appendChild(t);
+  const list = document.createElement("div"); list.className = "neighbors";
+  for (const id of g.members) {
+    const n = S.sim.get(id);
+    const d = document.createElement("div");
+    d.innerHTML = `<span></span>`;
+    d.querySelector("span").textContent = n ? n.label : id + " (gone)";
+    d.onclick = () => { if (n) { selectNode(id); centerOn(id); } };
+    list.appendChild(d);
+  }
+  el.appendChild(list);
+  const row = document.createElement("div"); row.className = "btnrow";
+  const bT = document.createElement("button");
+  bT.textContent = g.collapsed ? "expand" : "collapse";
+  bT.onclick = () => { g.collapsed = !g.collapsed; markDirty(); renderGroups(); renderGroupDetail(gid); applyFilters(); };
+  const bR = document.createElement("button");
+  bR.textContent = "rename";
+  bR.onclick = () => {
+    const v = prompt("group name", g.name);
+    if (v && v.trim()) { g.name = v.trim().slice(0, 80); markDirty(); renderGroups(); renderGroupDetail(gid); draw(); }
+  };
+  const bU = document.createElement("button");
+  bU.textContent = "ungroup";
+  bU.onclick = () => {
+    if (!confirm(`ungroup "${g.name}"? members stay in the graph.`)) return;
+    S.groups = S.groups.filter((x) => x.id !== g.id);
+    markDirty(); renderGroups(); applyFilters(); selectNode(null);
+  };
+  row.append(bT, bR, bU);
+  el.appendChild(row);
+}
+
+function renderGroups() {
+  const box = $("groupList");
+  box.innerHTML = "";
+  if (!S.groups.length) {
+    box.innerHTML = '<div class="empty">no groups yet — shift-click nodes to select, then group them</div>';
+    return;
+  }
+  for (const g of S.groups) {
+    const row = document.createElement("div"); row.className = "grouprow";
+    const nm = document.createElement("span"); nm.className = "gname"; nm.textContent = g.name;
+    nm.title = "open group";
+    nm.onclick = () => selectNode("group:" + g.id);
+    const cnt = document.createElement("span"); cnt.className = "pill";
+    cnt.textContent = g.members.length + (g.collapsed ? " · collapsed" : "");
+    const bT = document.createElement("button");
+    bT.textContent = g.collapsed ? "expand" : "collapse";
+    bT.title = g.collapsed ? "show members" : "hide members";
+    bT.onclick = () => { g.collapsed = !g.collapsed; markDirty(); renderGroups(); applyFilters(); };
+    const bS = document.createElement("button");
+    bS.textContent = "select"; bS.title = "select members";
+    bS.onclick = () => { S.multi = new Set(g.members.filter((id) => S.sim.has(id))); updateSelBar(); draw(); };
+    const bU = document.createElement("button");
+    bU.textContent = "ungroup"; bU.className = "danger"; bU.title = "remove the group, keep members";
+    bU.onclick = () => {
+      if (!confirm(`ungroup "${g.name}"? members stay in the graph.`)) return;
+      S.groups = S.groups.filter((x) => x.id !== g.id);
+      if (S.selected === "group:" + g.id) selectNode(null);
+      markDirty(); renderGroups(); applyFilters();
+    };
+    row.append(nm, cnt, bT, bS, bU);
+    box.appendChild(row);
+  }
+}
+
+// ---------------- merge nodes ----------------
+
+$("btnMerge").onclick = () => {
+  const ids = [...S.multi];
+  if (ids.length < 2) return;
+  const nodes = ids.map((id) => S.sim.get(id)).filter(Boolean);
+  if (nodes.some((n) => n.type === "city")) { alert("the city hub can't be merged"); return; }
+  $("mergeSummary").textContent =
+    `combine ${ids.length} nodes into one — edges are unioned and deduplicated, ` +
+    `details are concatenated with source attribution, and the most informative label is kept.`;
+  const box = $("mergeList");
+  box.innerHTML = "";
+  for (const n of nodes) {
+    const d = document.createElement("div");
+    d.textContent = n.label;
+    box.appendChild(d);
+  }
+  $("mergeModal").hidden = false;
+};
+$("mergeCancel").onclick = () => { $("mergeModal").hidden = true; };
+$("mergeConfirm").onclick = async () => {
+  $("mergeModal").hidden = true;
+  const btn = $("mergeConfirm");
+  btn.disabled = true;
+  try {
+    const r = await api("/api/graph/merge-nodes", {
+      method: "POST",
+      body: JSON.stringify({
+        nodes: S.recon.nodes, edges: S.recon.edges, ids: [...S.multi],
+        city: S.recon.city, country: S.recon.country || null,
+      }),
+    });
+    S.recon.nodes = r.nodes; S.recon.edges = r.edges;
+    resyncFromDoc(); clearMulti(); markDirty();
+    selectNode(r.merged.id); centerOn(r.merged.id);
+  } catch (e) {
+    alert("merge failed: " + e.message);
+  } finally {
+    btn.disabled = false;
+  }
+};
+
+// ---------------- groups from selection ----------------
+
+$("btnGroup").onclick = () => {
+  if (S.multi.size < 2) return;
+  const ids = [...S.multi];
+  if (ids.some((id) => S.sim.get(id)?.type === "city")) { alert("the city hub can't go in a group"); return; }
+  $("groupName").value = "";
+  $("groupName").placeholder = `group name — e.g. group ${S.groups.length + 1}`;
+  $("groupModal").hidden = false;
+  $("groupName").focus();
+};
+$("groupCancel").onclick = () => { $("groupModal").hidden = true; };
+$("groupCreate").onclick = () => {
+  const name = $("groupName").value.trim() || `group ${S.groups.length + 1}`;
+  const ids = [...S.multi];
+  S.groups.push({
+    id: "g" + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    name: name.slice(0, 80),
+    members: ids,
+    collapsed: false,
+  });
+  $("groupModal").hidden = true;
+  clearMulti(); markDirty(); renderGroups(); applyFilters();
+};
+$("btnClearSel").onclick = clearMulti;
+
+// ---------------- case files ----------------
+
+function caseSnapshot() {
+  const r = S.recon;
+  return {
+    city: r.city, country: r.country || null, country_code: r.country_code || null,
+    lat: r.lat ?? null, lon: r.lon ?? null, cityId: r.cityId || "",
+    facts: r.facts || {}, sources: r.sources || [],
+    nodes: r.nodes, edges: r.edges, groups: S.groups,
+  };
+}
+
+async function refreshCaseList() {
+  const box = $("caseList");
+  try {
+    const { cases } = await api("/api/cases");
+    box.innerHTML = "";
+    if (!cases.length) { box.innerHTML = '<div class="empty">no case files yet</div>'; return; }
+    for (const c of cases) {
+      const row = document.createElement("div"); row.className = "caserow";
+      const nm = document.createElement("div"); nm.className = "ct";
+      const t = document.createElement("span"); t.textContent = c.name;
+      const meta = document.createElement("div"); meta.className = "m";
+      meta.textContent = `${c.city || ""} · ${c.nodes} nodes · ${c.edges} edges · ${c.groups} groups · ${new Date(c.updated_at).toLocaleDateString()}`;
+      nm.append(t, meta);
+      const acts = document.createElement("div"); acts.className = "cacts";
+      const bO = document.createElement("button"); bO.textContent = "open";
+      bO.onclick = () => openCase(c.id, c.name);
+      const bM = document.createElement("button"); bM.textContent = "merge";
+      bM.title = "merge this case into the current graph";
+      bM.onclick = () => mergeCase(c.id, c.name);
+      const bD = document.createElement("button"); bD.textContent = "×"; bD.className = "x";
+      bD.title = "delete case";
+      bD.onclick = async () => {
+        if (!confirm(`delete case "${c.name}"?`)) return;
+        await api(`/api/cases/${c.id}`, { method: "DELETE" });
+        refreshCaseList();
+      };
+      acts.append(bO, bM, bD);
+      row.append(nm, acts);
+      box.appendChild(row);
+    }
+  } catch {
+    box.innerHTML = '<div class="empty">couldn\'t reach the server</div>';
+  }
+}
+
+async function openCases() {
+  $("casesModal").hidden = false;
+  $("caseSave").disabled = !S.recon;
+  await refreshCaseList();
+}
+$("btnCases").onclick = openCases;
+$("casesClose").onclick = () => { $("casesModal").hidden = true; };
+
+$("caseSave").onclick = async () => {
+  if (!S.recon) return;
+  const name = $("caseName").value.trim();
+  if (!name) { $("caseName").focus(); return; }
+  const btn = $("caseSave");
+  btn.disabled = true; btn.textContent = "saving…";
+  try {
+    const { id } = await api("/api/cases", {
+      method: "POST", body: JSON.stringify({ name, snapshot: caseSnapshot() }),
+    });
+    S.docKind = "case"; S.caseId = id; S.caseName = name; S.dirty = false;
+    $("caseName").value = "";
+    renderTitle(); refreshCaseList();
+  } catch (e) {
+    alert("save failed: " + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = "save current graph";
+  }
+};
+
+async function openCase(id, name) {
+  if (S.dirty && !confirm("discard unsaved changes?")) return;
+  try {
+    const { case: c } = await api(`/api/cases/${id}`);
+    $("casesModal").hidden = true;
+    stopPoll();
+    S.recon = {
+      id: "case:" + c.id, city: c.city || "", country: c.country || null,
+      country_code: c.country_code || null, lat: c.lat ?? null, lon: c.lon ?? null,
+      cityId: c.cityId || "", facts: c.facts || {}, sources: c.sources || [],
+      nodes: c.nodes || [], edges: c.edges || [], status: "ready", created_at: c.created_at,
+    };
+    S.groups = Array.isArray(c.groups) ? c.groups : [];
+    S.docKind = "case"; S.caseId = c.id; S.caseName = c.name; S.dirty = false;
+    S.sim.clear(); S.edges = []; S.selected = null; S.multi.clear();
+    S.view = { x: 0, y: 0, k: 1 };
+    S.typeFilter = new Set(ALL_TYPES);
+    selectNode(null); syncGraph(); renderTitle(); renderGroups(); updateSelBar();
+    renderDossier(S.recon.facts || {}, (S.recon.nodes || []).find((n) => n.type === "city"));
+    setTimeout(fit, 400);
+  } catch (e) {
+    alert("open failed: " + e.message);
+  }
+}
+
+// Merge a saved case into the working graph. Conflict rule: nodes dedupe by
+// id, existing fields win on conflict, the incoming case only fills empty
+// fields (details concatenate), edges dedupe by endpoints+label. New nodes
+// land on the golden-angle spiral via syncGraph.
+async function mergeCase(id, name) {
+  if (!S.recon) { alert("load a recon or open a case first"); return; }
+  if (!confirm(`merge case "${name}" into the current graph? nodes dedupe by id; existing fields win.`)) return;
+  try {
+    const { case: c } = await api(`/api/cases/${id}`);
+    const r = await api("/api/graph/merge", {
+      method: "POST",
+      body: JSON.stringify({
+        nodes: S.recon.nodes, edges: S.recon.edges,
+        add: { nodes: c.nodes || [], edges: c.edges || [] },
+        city: S.recon.city, country: S.recon.country || null,
+      }),
+    });
+    S.recon.nodes = r.nodes; S.recon.edges = r.edges;
+    resyncFromDoc(); markDirty();
+  } catch (e) {
+    alert("merge failed: " + e.message);
+  }
 }
 
 // ---------------- top actions ----------------
@@ -735,15 +1231,37 @@ $("noteCancel").onclick = () => { $("noteModal").hidden = true; };
 $("noteSave").onclick = async () => {
   const label = $("noteLabel").value.trim();
   if (!label) { $("noteLabel").focus(); return; }
-  await api(`/api/recon/${S.recon.id}/notes`, {
-    method: "POST",
-    body: JSON.stringify({ label, body: $("noteBody").value, link_to: S.selected }),
-  });
+  const body = $("noteBody").value;
+  if (S.docKind === "case") {
+    // case views keep notes in the working document until saved
+    const nid = `note:${Date.now().toString(36)}`;
+    const target = S.recon.nodes.some((n) => n.id === S.selected) ? S.selected : S.recon.nodes[0]?.id;
+    S.recon.nodes.push({ id: nid, label, type: "note", source: "analyst", detail: body.slice(0, 2000) });
+    if (target) S.recon.edges.push({ from: nid, to: target, label: "annotates" });
+    try {
+      const r = await api("/api/graph/interlink", {
+        method: "POST",
+        body: JSON.stringify({ nodes: S.recon.nodes, edges: S.recon.edges, city: S.recon.city, country: S.recon.country || null }),
+      });
+      S.recon.edges = r.edges;
+    } catch (e) { /* keyword edges are best-effort */ }
+    resyncFromDoc(); markDirty(); selectNode(nid);
+  } else {
+    await api(`/api/recon/${S.recon.id}/notes`, {
+      method: "POST",
+      body: JSON.stringify({ label, body, link_to: S.selected }),
+    });
+    loadRecon(S.recon.id);
+  }
   $("noteModal").hidden = true;
-  loadRecon(S.recon.id);
 };
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") { $("noteModal").hidden = true; $("keysModal").hidden = true; $("searchResults").hidden = true; }
+  if (e.key === "Escape") {
+    $("noteModal").hidden = true; $("keysModal").hidden = true;
+    $("casesModal").hidden = true; $("mergeModal").hidden = true; $("groupModal").hidden = true;
+    $("searchResults").hidden = true;
+    if (S.multi.size) clearMulti();
+  }
 });
 
 // ---------------- keys modal ----------------
@@ -883,6 +1401,6 @@ if (document.readyState === "loading") document.addEventListener("DOMContentLoad
 else boot();
 
 // test seam
-window.__meridian = { S, COLORS, syncGraph, tick, draw, applyFilters, searchNodes, hitNode, centerOn, fit, w2s, s2w, selectNode, radiusFor, wake, kick, loop, truncLabel, renderKeyList, openKeys };
+window.__meridian = { S, COLORS, syncGraph, tick, draw, applyFilters, searchNodes, hitNode, hitGroup, centerOn, fit, w2s, s2w, selectNode, radiusFor, wake, kick, loop, truncLabel, renderKeyList, openKeys, groupBoxes, toggleMulti, clearMulti, updateSelBar, markDirty, renderTitle, resyncFromDoc, renderGroups, renderGroupDetail, refreshCaseList, openCase, mergeCase, caseSnapshot, marqueeSelect };
 
 })();

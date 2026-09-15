@@ -162,6 +162,35 @@ with ellipsis; the full text is on the `title` tooltip.
   code, region, and the Wikipedia profile, all in the right rail.
 - **Export** — full recon as JSON, nodes as CSV.
 
+## Graph analysis tools
+
+Four tools for working a case — available from the top bar and the selection
+toolbar:
+
+- **Case files** — named snapshots of the working graph: city metadata, dossier
+  facts, source states, nodes, edges, analyst notes, and groups. Stored in
+  `data/cases/` (gitignored, files written with mode `0600`). Save the current
+  view under a name, open a case to load it, delete old ones, or **merge** a
+  saved case into whatever you're looking at. Manual-save by design: merges,
+  groups, and edits mark the view dirty (`●` in the title) until you save.
+- **Merge nodes** — shift-click (or shift-drag) to multi-select, then *merge*.
+  The most informative node survives (label + detail + URL + subtype richness);
+  the others are absorbed. Details concatenate with `[label · source]`
+  attribution, contributor IDs and sources are preserved, edges are unioned and
+  deduplicated, merge-created self-edges are removed, and keyword links are
+  recomputed afterward. The city hub can't be merged.
+- **Groups** — named, one-level collections: shift-click nodes, *group*, name
+  it. Expanded groups draw as a labeled container behind their members;
+  collapse one and it becomes a single bubble (members hidden, hit-testable).
+  Rename, expand/collapse, select-members, or ungroup (members stay in the
+  graph) from the right rail or the detail panel.
+- **Merge graphs** — merge a saved case into the current graph. Nodes dedupe
+  by id; the conflict rule is existing-wins — the current graph's fields win,
+  the incoming case only fills blanks, and differing details concatenate.
+  Edges dedupe by endpoints + label, dangling edges are dropped, and new nodes
+  land on the golden-angle spiral. Analyst notes are ordinary nodes, so they're
+  retained by both merge paths.
+
 ## API
 
 ```
@@ -176,9 +205,18 @@ GET  /api/keys                                             # key defs + masked s
 POST /api/keys { key, value } → { keys }                   # save a key
 DEL  /api/keys/:id                                         # clear the stored key
 POST /api/keys/test { key } → { ok, detail | error }       # probe the live API
+GET  /api/cases                                            # list case files
+POST /api/cases { name, snapshot } → { id }                # save a case file
+GET  /api/cases/:id                                        # open a case file
+DEL  /api/cases/:id
+POST /api/graph/merge-nodes { nodes, edges, ids, city, country? }
+POST /api/graph/merge { nodes, edges, add, city, country? } # case → working graph
+POST /api/graph/interlink { nodes, edges, city, country? } # recompute keyword edges
+POST /api/graph/deep-search { nodes, edges, nodeId, city, country? } # deep search on a case view
 ```
 
 Recons persist in `data/meridian.db` (SQLite via `bun:sqlite`, gitignored).
+Case files persist in `data/cases/` (JSON, gitignored).
 
 ## Notes
 
@@ -186,6 +224,16 @@ Recons persist in `data/meridian.db` (SQLite via `bun:sqlite`, gitignored).
   parsers (Overpass JSON, RSS, SPARQL) are hand-rolled.
 - Designed for the "8–10 hour sprint": collection takes ~30–60s; the sprint
   clock and the note tool are for the human hours that follow.
+- Verified 2026-09-15: 106/106 for the graph analysis tools — 47/47 pure unit
+  checks (node merge edge-union + detail/source preservation + provenance,
+  group create/collapse/rename/ungroup/prune, case save→open round-trip,
+  case-merge node/edge dedupe and the existing-wins conflict rule, keyword
+  interlink recomputation after merges), 25/25 HTTP checks against a booted
+  server (case CRUD, merge-nodes, merge, interlink, deep-search validation),
+  34/34 DOM-stubbed frontend checks (cases panel render/open, selection
+  toolbar, group containers + collapsed bubbles, hit-testing, marquee select,
+  dirty-state title, merge resync pruning). No live network calls were made
+  from the build environment.
 - Verified 2026-09-15: 60/60 for the Keys screen — 24/24 key-store unit checks
   (env-wins resolution, masking, 0600 file, collector pickup with no restart),
   15/15 live-API checks against a booted server (set/get/clear, validation,

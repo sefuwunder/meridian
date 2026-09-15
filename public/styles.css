@@ -161,3 +161,41 @@ textarea{min-height:90px; resize:vertical; font-family:inherit}
 @media (prefers-reduced-motion:reduce){
   *{transition:none !important}
 }
+
+/* selection toolbar + marquee */
+.selbar{position:absolute; bottom:56px; left:50%; transform:translateX(-50%); display:flex; gap:8px; align-items:center;
+  background:var(--panel); border:1px solid var(--line); border-radius:99px; padding:6px 8px 6px 14px; z-index:5;
+  box-shadow:0 8px 28px rgba(0,0,0,.4); font-size:12.5px; white-space:nowrap}
+.selbar[hidden]{display:none}
+.selbar button{padding:5px 10px}
+.marquee{position:absolute; border:1px solid var(--acc2); background:rgba(91,140,255,.12); z-index:4; pointer-events:none}
+.marquee[hidden]{display:none}
+
+/* case files */
+.casemodal{width:min(560px,94vw)}
+.caselist{display:flex; flex-direction:column; gap:8px; max-height:46vh; overflow-y:auto}
+.caserow{background:var(--panel2); border:1px solid var(--line); border-radius:10px; padding:9px 11px;
+  display:flex; gap:8px; align-items:center}
+.caserow .ct{flex:1; min-width:0}
+.caserow .ct > span{font-weight:700; font-size:13px; display:block; white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.caserow .m{color:var(--mut); font-size:11.5px; margin-top:2px}
+.caserow .cacts{display:flex; gap:6px; flex:none}
+.caserow .cacts button{padding:5px 10px; font-size:12px}
+.caserow .x{color:var(--mut); background:none; border:none; padding:5px 8px}
+.caserow .x:hover{color:var(--fail)}
+.mergelist{display:flex; flex-direction:column; gap:4px; max-height:30vh; overflow-y:auto}
+.mergelist div{background:var(--panel2); border:1px solid var(--line); border-radius:8px; padding:6px 10px; font-size:12.5px}
+
+/* groups */
+.grouplist{display:flex; flex-direction:column; gap:6px}
+.grouprow{display:flex; gap:6px; align-items:center; background:var(--panel2);
+  border:1px solid var(--line); border-radius:10px; padding:7px 9px}
+.grouprow .gname{flex:1; min-width:0; font-weight:600; font-size:12.5px; cursor:pointer;
+  white-space:nowrap; overflow:hidden; text-overflow:ellipsis}
+.grouprow .gname:hover{color:var(--acc2)}
+.grouprow button{padding:4px 9px; font-size:11.5px}
+button.danger{color:#ff9d9d}
+button.linklike{background:none; border:none; padding:0; color:var(--acc2); font-size:12px; cursor:pointer}
+button.linklike:hover{text-decoration:underline; box-shadow:none; transform:none}
+.btnrow{display:flex; gap:8px; margin-top:10px}
+.btnrow button{flex:1}

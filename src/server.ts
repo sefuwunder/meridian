@@ -19,6 +19,8 @@ import {
 import {
   KEY_DEFS, keyStatuses, storeKey, clearStoredKey, resolveKey,
 } from "./keys";
+import { mergeNodes, mergeCaseInto } from "./graph";
+import { listCases, getCase, saveCase, deleteCase } from "./cases";
 
 const PORT = Number(process.env.PORT || 3005);
 const running = new Set<string>();
@@ -164,6 +166,119 @@ const server = Bun.serve({
         } catch (e: any) {
           return json({ ok: false, error: String(e?.message || e).slice(0, 140) }, 200);
         }
+      }
+
+      // ---------- case files ----------
+      // Cases are the durable layer for analysis work: a named snapshot of
+      // the working graph (nodes, edges, analyst notes, groups, dossier,
+      // per-source states). They live in data/cases/ (gitignored, mode 0600)
+      // — recon data is never committed.
+      if (path === "/api/cases" && method === "GET") return json({ cases: listCases() });
+      if (path === "/api/cases" && method === "POST") {
+        const b = await readBody(req);
+        const name = String(b.name || "").trim();
+        if (!name) return json({ error: "name is required" }, 400);
+        if (name.length > 120) return json({ error: "name too long" }, 400);
+        const s = b.snapshot || {};
+        if (!Array.isArray(s.nodes) || !Array.isArray(s.edges))
+          return json({ error: "snapshot.nodes/edges are required" }, 400);
+        if (s.nodes.length > 50000 || s.edges.length > 200000)
+          return json({ error: "snapshot too large" }, 400);
+        const c = saveCase(name, {
+          city: String(s.city || ""),
+          country: s.country ?? null,
+          country_code: s.country_code ?? null,
+          lat: s.lat ?? null, lon: s.lon ?? null,
+          cityId: String(s.cityId || ""),
+          facts: s.facts && typeof s.facts === "object" ? s.facts : {},
+          sources: Array.isArray(s.sources) ? s.sources : [],
+          nodes: s.nodes, edges: s.edges,
+          groups: Array.isArray(s.groups) ? s.groups : [],
+        });
+        return json({ id: c.id }, 201);
+      }
+      const caseMatch = path.match(/^\/api\/cases\/([A-Za-z0-9_-]+)$/);
+      if (caseMatch) {
+        const c = getCase(caseMatch[1]);
+        if (!c) return json({ error: "not found" }, 404);
+        if (method === "GET") return json({ case: c });
+        if (method === "DELETE") { deleteCase(caseMatch[1]); return json({ ok: true }); }
+      }
+
+      // ---------- graph analysis ----------
+      // merge-nodes, merge (case into graph), interlink, and deep-search all
+      // operate on an explicit client-supplied graph so they work on recons
+      // and opened cases alike. Keyword interlinks are recomputed with the
+      // same extractor the collectors use.
+      const graphBody = async () => {
+        const b = await readBody(req);
+        if (!Array.isArray(b.nodes) || !Array.isArray(b.edges))
+          throw new Error("nodes and edges are required");
+        return b;
+      };
+      if (path === "/api/graph/merge-nodes" && method === "POST") {
+        try {
+          const b = await graphBody();
+          if (!Array.isArray(b.ids)) return json({ error: "ids are required" }, 400);
+          const r = mergeNodes(b.nodes, b.edges, b.ids.map(String));
+          const edges = interlink(r.nodes, r.edges, String(b.city || ""), b.country ?? null);
+          return json({ nodes: r.nodes, edges, merged: r.merged, absorbed: r.absorbed });
+        } catch (e: any) {
+          return json({ error: String(e?.message || e).slice(0, 200) }, 400);
+        }
+      }
+      if (path === "/api/graph/merge" && method === "POST") {
+        try {
+          const b = await graphBody();
+          if (!b.add || !Array.isArray(b.add.nodes) || !Array.isArray(b.add.edges))
+            return json({ error: "add.{nodes,edges} are required" }, 400);
+          const beforeIds = new Set(b.nodes.map((n: GNode) => n.id));
+          const ekey = (e: GEdge) => `${e.from}>${e.to}:${e.label}`;
+          const beforeEdges = new Set(b.edges.map(ekey));
+          let { nodes, edges } = mergeCaseInto(
+            { nodes: b.nodes, edges: b.edges },
+            { nodes: b.add.nodes, edges: b.add.edges }
+          );
+          edges = interlink(nodes, edges, String(b.city || ""), b.country ?? null);
+          return json({
+            nodes, edges,
+            addedNodes: nodes.filter((n) => !beforeIds.has(n.id)).length,
+            addedEdges: edges.filter((e) => !beforeEdges.has(ekey(e))).length,
+          });
+        } catch (e: any) {
+          return json({ error: String(e?.message || e).slice(0, 200) }, 400);
+        }
+      }
+      if (path === "/api/graph/interlink" && method === "POST") {
+        try {
+          const b = await graphBody();
+          return json({ edges: interlink(b.nodes, b.edges, String(b.city || ""), b.country ?? null) });
+        } catch (e: any) {
+          return json({ error: String(e?.message || e).slice(0, 200) }, 400);
+        }
+      }
+      if (path === "/api/graph/deep-search" && method === "POST") {
+        let b: any;
+        try { b = await graphBody(); }
+        catch (e: any) { return json({ error: String(e?.message || e).slice(0, 200) }, 400); }
+        const nodeId = String(b.nodeId || "");
+        if (!nodeId) return json({ error: "nodeId is required" }, 400);
+        const target = b.nodes.find((n: GNode) => n.id === nodeId);
+        if (!target) return json({ error: "node not found" }, 404);
+        const beforeIds = new Set(b.nodes.map((n: GNode) => n.id));
+        const ekey = (e: GEdge) => `${e.from}>${e.to}:${e.label}`;
+        const beforeEdges = new Set(b.edges.map(ekey));
+        const ds = await deepSearchNode(target, b.nodes, { city: String(b.city || ""), country: b.country ?? null });
+        let { nodes, edges } = mergeGraph({ nodes: b.nodes, edges: b.edges }, ds);
+        edges = interlink(nodes, edges, String(b.city || ""), b.country ?? null);
+        const flagged = nodes.find((n) => n.id === nodeId);
+        if (flagged) flagged.deepSearched = true;
+        return json({
+          nodes, edges,
+          addedNodes: nodes.filter((n) => !beforeIds.has(n.id)).length,
+          addedEdges: edges.filter((e) => !beforeEdges.has(ekey(e))).length,
+          keywords: ds.keywords,
+        });
       }
 
       // ---------- recons ----------

@@ -19,6 +19,7 @@
     <button id="btnNote" title="add an analyst note node">+ note</button>
     <button id="btnExport" title="download recon as JSON">export</button>
     <button id="btnCsv" title="download nodes as CSV">csv</button>
+    <button id="btnCases" title="save / open / merge case files">cases</button>
     <button id="btnKeys" title="manage API keys">keys</button>
   </div>
 </header>
@@ -50,7 +51,14 @@
     <div id="searchResults" hidden></div>
   </div>
   <div class="chips" id="typeChips"></div>
-  <div class="hint">drag to pan · scroll to zoom · drag a node to move it · click a node for detail</div>
+  <div id="selBar" class="selbar" hidden>
+    <span id="selCount"></span>
+    <button id="btnMerge" title="combine selected nodes into one">merge</button>
+    <button id="btnGroup" title="put selected nodes in a named group">group</button>
+    <button id="btnClearSel" title="clear selection">clear</button>
+  </div>
+  <div id="marquee" class="marquee" hidden></div>
+  <div class="hint">drag to pan · scroll to zoom · drag a node to move it · click a node for detail · shift-click / shift-drag to multi-select</div>
   <div class="counts" id="graphCounts"></div>
 </main>
 
@@ -62,6 +70,10 @@
   <section class="panel grow">
     <h3>node detail</h3>
     <div id="nodeDetail" class="empty">click any node in the web</div>
+  </section>
+  <section class="panel">
+    <h3>groups</h3>
+    <div id="groupList" class="grouplist"><div class="empty">no groups yet — shift-click nodes to select, then group them</div></div>
   </section>
 </aside>
 
@@ -84,6 +96,44 @@
     <div id="keyList" class="keylist"></div>
     <div class="row">
       <button id="keysClose">close</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-back" id="casesModal" hidden>
+  <div class="modal casemodal">
+    <h3>case files</h3>
+    <p class="fine" style="margin:0">cases are named snapshots of the working graph — nodes, edges, analyst notes, groups, dossier and source states. they live in <span class="mono">data/cases/</span> on this machine (never committed). merges, groups and edits mark the view dirty until you save.</p>
+    <div class="row">
+      <input id="caseName" placeholder="case name — e.g. dakar-ports" autocomplete="off">
+      <button id="caseSave" class="primary" style="flex:none;width:auto">save current graph</button>
+    </div>
+    <div id="caseList" class="caselist"></div>
+    <div class="row">
+      <button id="casesClose">close</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-back" id="mergeModal" hidden>
+  <div class="modal">
+    <h3>merge nodes</h3>
+    <p class="fine" style="margin:0" id="mergeSummary"></p>
+    <div id="mergeList" class="mergelist"></div>
+    <div class="row">
+      <button id="mergeConfirm" class="primary">merge</button>
+      <button id="mergeCancel">cancel</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-back" id="groupModal" hidden>
+  <div class="modal">
+    <h3>new group</h3>
+    <input id="groupName" placeholder="group name" autocomplete="off">
+    <div class="row">
+      <button id="groupCreate" class="primary">create group</button>
+      <button id="groupCancel">cancel</button>
     </div>
   </div>
 </div>
