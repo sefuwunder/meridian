@@ -13,8 +13,12 @@ import {
   collectGdelt, collectGleif, collectOpensky, collectOpenalex,
   collectGdacs, collectChronicling,
   collectIcig, collectOccrp, collectUrlscan, collectNonprofits, collectOpenfec,
+  probeKeySource,
   type Ctx, type GNode, type GEdge, type SourceResult,
 } from "./sources";
+import {
+  KEY_DEFS, keyStatuses, storeKey, clearStoredKey, resolveKey,
+} from "./keys";
 
 const PORT = Number(process.env.PORT || 3005);
 const running = new Set<string>();
@@ -128,6 +132,40 @@ const server = Bun.serve({
     const path = url.pathname;
     const method = req.method;
     try {
+      // ---------- api keys ----------
+      if (path === "/api/keys" && method === "GET") return json({ keys: keyStatuses() });
+      if (path === "/api/keys" && method === "POST") {
+        const b = await readBody(req);
+        const id = String(b.key || "");
+        const def = KEY_DEFS.find((d) => d.id === id);
+        if (!def) return json({ error: "unknown key" }, 400);
+        const value = String(b.value || "").trim();
+        if (!value) return json({ error: "value is required" }, 400);
+        if (value.length > 500) return json({ error: "value too long" }, 400);
+        storeKey(id, value);
+        return json({ keys: keyStatuses() });
+      }
+      const keyDelMatch = path.match(/^\/api\/keys\/([A-Za-z0-9_]+)$/);
+      if (keyDelMatch && method === "DELETE") {
+        const id = keyDelMatch[1];
+        if (!KEY_DEFS.some((d) => d.id === id)) return json({ error: "unknown key" }, 400);
+        clearStoredKey(id);
+        return json({ keys: keyStatuses() });
+      }
+      if (path === "/api/keys/test" && method === "POST") {
+        const b = await readBody(req);
+        const id = String(b.key || "");
+        if (!KEY_DEFS.some((d) => d.id === id)) return json({ error: "unknown key" }, 400);
+        const key = resolveKey(id);
+        if (!key) return json({ error: "no key configured" }, 400);
+        try {
+          const probe = await probeKeySource(id, key);
+          return json({ ok: true, detail: probe.detail });
+        } catch (e: any) {
+          return json({ ok: false, error: String(e?.message || e).slice(0, 140) }, 200);
+        }
+      }
+
       // ---------- recons ----------
       if (path === "/api/recon" && method === "GET") return json({ recons: listRecons() });
       if (path === "/api/recon" && method === "POST") {

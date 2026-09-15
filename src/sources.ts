@@ -1,7 +1,11 @@
-// meridian — OSINT collectors. Every source is free and keyless.
+// meridian — OSINT collectors. Most sources are free and keyless; the
+// keyed-free ones (OCCRP Aleph, OpenFEC) read their keys through
+// ./keys (env var wins, then the Keys screen, then none).
 // Each collector returns graph nodes + edges; failures throw and are
 // recorded per-source by the runner (best-effort: one dead source never
 // kills the recon).
+
+import { resolveKey } from "./keys";
 
 export type NodeType =
   | "city" | "place" | "culture" | "org" | "infra"
@@ -826,8 +830,9 @@ export async function collectIcig(ctx: Ctx): Promise<SourceResult> {
 }
 
 // ---------- 18. investigative data (OCCRP Aleph) ----------
-// Keyed-free: anonymous search 401s since mid-2026. The key is read from the
-// OCCRP_API_KEY env var — never committed. With no key the collector stays
+// Keyed-free: anonymous search 401s since mid-2026. The key resolves via
+// ./keys (OCCRP_API_KEY env var wins, then the Keys screen) — never
+// committed. With no key the collector stays
 // idle (zero nodes, success state, setup hint in the note) and never breaks
 // the sprint. Endpoint shape follows the public Aleph API
 // (Authorization: ApiKey header, /api/2/search?q=, results[] with
@@ -848,11 +853,11 @@ function alephNodeType(schema: string): { type: NodeType; subtype: string } {
 }
 
 export async function collectOccrp(ctx: Ctx): Promise<SourceResult> {
-  const key = (process.env.OCCRP_API_KEY || "").trim();
+  const key = resolveKey("OCCRP_API_KEY");
   if (!key) {
     return {
       nodes: [], edges: [],
-      note: "idle — set the OCCRP_API_KEY env var (free account at data.occrp.org) to activate",
+      note: "idle — add a free key on the Keys screen (top bar) to activate",
     };
   }
   const j = await fetchJson(
@@ -1005,7 +1010,7 @@ export async function collectNonprofits(ctx: Ctx): Promise<SourceResult> {
 
 // ---------- 21. campaign finance (OpenFEC) ----------
 // Keyed-free: DEMO_KEY works keyless at 30 req/hr; a personal free key via
-// the OPENFEC_API_KEY env var raises it to 1,000/hr. Two sequential requests
+// OPENFEC_API_KEY (env var or the Keys screen) raises it to 1,000/hr. Two sequential requests
 // per recon, well inside either quota. US-only (state filter required), so
 // non-US cities or an unknown state skip cleanly with zero nodes.
 // Endpoints (public OpenFEC v1 API): /committee/?state=&per_page=,
@@ -1027,7 +1032,7 @@ export async function collectOpenfec(ctx: Ctx): Promise<SourceResult> {
   if (!ctx.state) {
     return { nodes: [], edges: [], note: "skipped — US state not resolved from geocode" };
   }
-  const key = (process.env.OPENFEC_API_KEY || "").trim() || "DEMO_KEY";
+  const key = resolveKey("OPENFEC_API_KEY") || "DEMO_KEY";
   const get = async (path: string): Promise<any> => {
     try {
       return await fetchJson(`${FEC_BASE}${path}${path.includes("?") ? "&" : "?"}api_key=${key}`, {}, 25000);
@@ -1326,4 +1331,24 @@ export function mergeGraph(
     if (!seen.has(k) && byId.has(e.from) && byId.has(e.to)) { seen.add(k); edges.push(e); }
   }
   return { nodes: [...byId.values()], edges };
+}
+
+// Probe a configured key against its live API (used by the Keys screen
+// "test" button). One tiny request; throws on HTTP/auth errors so the
+// caller can report pass/fail. Never leaks the key anywhere.
+export async function probeKeySource(id: string, key: string): Promise<{ ok: boolean; detail: string }> {
+  if (!key) throw new Error("no key configured");
+  if (id === "OCCRP_API_KEY") {
+    const j = await fetchJson(
+      `${OCCRP_HOST}/api/2/search?q=test&limit=1`,
+      { headers: { Authorization: `ApiKey ${key}` } }, 15000);
+    const total = Number(j?.total ?? (Array.isArray(j?.results) ? j.results.length : 0));
+    return { ok: true, detail: Number.isFinite(total) ? `authenticated — search returned (total ${total})` : "authenticated" };
+  }
+  if (id === "OPENFEC_API_KEY") {
+    const j = await fetchJson(`${FEC_BASE}/candidates/?api_key=${key}&per_page=1`, {}, 15000);
+    const results = Array.isArray(j?.results) ? j.results : [];
+    return { ok: true, detail: `authenticated — ${results.length ? "sample candidate returned" : "query accepted"}` };
+  }
+  throw new Error(`no probe for key ${id}`);
 }

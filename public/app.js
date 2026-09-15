@@ -743,8 +743,89 @@ $("noteSave").onclick = async () => {
   loadRecon(S.recon.id);
 };
 document.addEventListener("keydown", (e) => {
-  if (e.key === "Escape") { $("noteModal").hidden = true; $("searchResults").hidden = true; }
+  if (e.key === "Escape") { $("noteModal").hidden = true; $("keysModal").hidden = true; $("searchResults").hidden = true; }
 });
+
+// ---------------- keys modal ----------------
+
+function keyMsg(row, text, cls) {
+  const m = row.querySelector(".keymsg");
+  m.textContent = text;
+  m.className = "keymsg" + (cls ? " " + cls : "");
+}
+
+function renderKeyList(keys) {
+  const box = $("keyList");
+  box.innerHTML = "";
+  for (const k of keys) {
+    const row = document.createElement("div");
+    row.className = "keyrow";
+    const state = k.via === "env" ? "collecting" : k.configured ? "ready" : "failed";
+    const stateText = k.via === "env" ? "via env" : k.configured ? "configured" : "missing";
+    row.innerHTML =
+      `<div class="keyhead"><span class="keyname"></span><span class="ktag"></span>` +
+      `<span class="pill ${state}">${stateText}</span></div>` +
+      `<div class="keybenefit"></div>` +
+      `<div class="keyrow2"><a class="keysignup" target="_blank" rel="noopener"></a><span class="keymasked"></span></div>` +
+      `<div class="keyinput"><input type="password" placeholder="paste key…" autocomplete="off" spellcheck="false" aria-label="api key">` +
+      `<button class="save">save</button><button class="test">test</button><button class="clear">clear</button></div>` +
+      `<div class="keymsg"></div>`;
+    row.querySelector(".keyname").textContent = k.name;
+    row.querySelector(".ktag").textContent = k.required ? "required" : "optional";
+    row.querySelector(".keybenefit").textContent = k.benefit;
+    const a = row.querySelector(".keysignup");
+    a.href = k.signup; a.textContent = "get a key → " + k.signupLabel;
+    row.querySelector(".keymasked").textContent = k.via === "env"
+      ? "set in the environment — env wins"
+      : (k.masked ? "stored as " + k.masked : "no key saved");
+    const input = row.querySelector("input");
+    row.querySelector(".save").onclick = async () => {
+      const v = input.value.trim();
+      if (!v) { keyMsg(row, "paste a key first", "err"); return; }
+      keyMsg(row, "saving…");
+      try {
+        const { keys: fresh } = await api("/api/keys", {
+          method: "POST", body: JSON.stringify({ key: k.id, value: v }),
+        });
+        renderKeyList(fresh);
+      } catch (e) { keyMsg(row, "save failed: " + e.message, "err"); }
+    };
+    row.querySelector(".test").onclick = async () => {
+      keyMsg(row, "testing…");
+      try {
+        const r = await api("/api/keys/test", {
+          method: "POST", body: JSON.stringify({ key: k.id }),
+        });
+        keyMsg(row, r.ok ? "live — " + (r.detail || "key works") : "test failed: " + (r.error || "rejected"), r.ok ? "ok" : "err");
+      } catch (e) { keyMsg(row, "test failed: " + e.message, "err"); }
+    };
+    const clearBtn = row.querySelector(".clear");
+    if (k.via === "stored") {
+      clearBtn.onclick = async () => {
+        try {
+          const { keys: fresh } = await api("/api/keys/" + encodeURIComponent(k.id), { method: "DELETE" });
+          renderKeyList(fresh);
+        } catch (e) { keyMsg(row, "clear failed: " + e.message, "err"); }
+      };
+    } else {
+      clearBtn.disabled = true;
+      clearBtn.title = k.via === "env" ? "key comes from the environment — unset it there" : "nothing stored";
+    }
+    box.appendChild(row);
+  }
+}
+
+async function openKeys() {
+  $("keysModal").hidden = false;
+  try {
+    const { keys } = await api("/api/keys");
+    renderKeyList(keys);
+  } catch {
+    $("keyList").innerHTML = `<div class="empty">couldn't reach the server</div>`;
+  }
+}
+$("btnKeys").onclick = openKeys;
+$("keysClose").onclick = () => { $("keysModal").hidden = true; };
 
 // new recon form
 function renderSourceChecks() {
@@ -802,6 +883,6 @@ if (document.readyState === "loading") document.addEventListener("DOMContentLoad
 else boot();
 
 // test seam
-window.__meridian = { S, COLORS, syncGraph, tick, draw, applyFilters, searchNodes, hitNode, centerOn, fit, w2s, s2w, selectNode, radiusFor, wake, kick, loop, truncLabel };
+window.__meridian = { S, COLORS, syncGraph, tick, draw, applyFilters, searchNodes, hitNode, centerOn, fit, w2s, s2w, selectNode, radiusFor, wake, kick, loop, truncLabel, renderKeyList, openKeys };
 
 })();

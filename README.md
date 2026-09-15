@@ -20,7 +20,11 @@ bun src/server.ts
 # → http://localhost:3005
 ```
 
-Optional keys (never committed; read from environment):
+Optional keys (never committed). Resolution order: **env var wins**, then the
+key saved on the **Keys screen** (top bar), then none. Keys entered in the
+browser are stored in `data/keys.json` (gitignored, mode 0600) and take
+effect immediately — no restart needed. The Keys screen shows masked status
+only (last 4 chars) and has a per-key live test.
 
 ```bash
 OCCRP_API_KEY=...    # free account at data.occrp.org — activates the OCCRP Aleph collector
@@ -52,10 +56,10 @@ the header tracks elapsed time.
 | 15 | GDACS | disaster alerts (earthquake, cyclone, flood, volcano, drought, wildfire) from the last 90 days, filtered to events in the recon's country or within ~250 km of the city; nodes carry alert level, event type, date, and report link. Keyless, free with attribution. |
 | 16 | Library of Congress Chronicling America | historic US newspaper pages (1770–1963) mentioning the city: newspaper title, place of publication, date, link to the LOC page. Keyless, US public domain. One query per recon (~10 req/min guideline); non-US cities skip cleanly. |
 | 17 | ICIJ Offshore Leaks | keyless reconciliation API: entities, officers, and intermediaries matching the city across all five leak namespaces (Panama/Paradise/Pandora/Bahamas/Offshore), with match scores and node links. |
-| 18 | OCCRP Aleph | entity search across 300+ investigative datasets (company registries, procurement, sanctions, leaks) on the Follow-the-Money model. Keyed-free: stays idle with a setup hint until `OCCRP_API_KEY` is set; never blocks the sprint. |
+| 18 | OCCRP Aleph | entity search across 300+ investigative datasets (company registries, procurement, sanctions, leaks) on the Follow-the-Money model. Keyed-free: stays idle with a setup hint (pointing at the Keys screen) until a key is configured; never blocks the sprint. |
 | 19 | urlscan.io | keyless search API: recent public web scans whose page URL mentions the city, expanded into domain → IP → ASN infra nodes with scan links and malicious-verdict flags. One request per recon (~30/min anonymous quota); HTTP 429 ends the source for the run, never retried. |
 | 20 | ProPublica Nonprofit Explorer v2 | keyless: IRS nonprofits actually based in the recon city (filtered on the org's city field), with NTEE category and 501(c) subsection. One request per recon. |
-| 21 | OpenFEC | keyed-free: campaign committees in the recon's US state plus itemized donors → person→committee "donated to" edges. Works on the built-in demo key at 30 req/hr; `OPENFEC_API_KEY` raises the limit. Two requests per recon. |
+| 21 | OpenFEC | keyed-free: campaign committees in the recon's US state plus itemized donors → person→committee "donated to" edges. Works on the built-in demo key at 30 req/hr; `OPENFEC_API_KEY` (env or Keys screen) raises the limit. Two requests per recon. |
 
 Every source is best-effort and independent: one dead API marks its row failed
 in the collection panel and the sprint continues. Nothing is ever half-merged —
@@ -168,6 +172,10 @@ DEL  /api/recon/:id
 POST /api/recon/:id/notes  { label, body, link_to? } → { node }
 POST /api/recon/:id/deep-search { nodeId } → { addedNodes, addedEdges, keywords }
 GET  /api/recon/:id/export                                 # JSON download
+GET  /api/keys                                             # key defs + masked status (never full keys)
+POST /api/keys { key, value } → { keys }                   # save a key
+DEL  /api/keys/:id                                         # clear the stored key
+POST /api/keys/test { key } → { ok, detail | error }       # probe the live API
 ```
 
 Recons persist in `data/meridian.db` (SQLite via `bun:sqlite`, gitignored).
@@ -178,6 +186,12 @@ Recons persist in `data/meridian.db` (SQLite via `bun:sqlite`, gitignored).
   parsers (Overpass JSON, RSS, SPARQL) are hand-rolled.
 - Designed for the "8–10 hour sprint": collection takes ~30–60s; the sprint
   clock and the note tool are for the human hours that follow.
+- Verified 2026-09-15: 60/60 for the Keys screen — 24/24 key-store unit checks
+  (env-wins resolution, masking, 0600 file, collector pickup with no restart),
+  15/15 live-API checks against a booted server (set/get/clear, validation,
+  full key never in any GET response), 21/21 DOM-stubbed frontend checks
+  (modal render, save/test/clear flows). No live network calls were made from
+  the build environment.
 - Verified 2026-09-14: 64/64 collector + merge checks against stubbed sources
   (incl. GDELT/GLEIF/OpenSky/OpenAlex mapping, caps, empty-result and
   HTTP-error isolation), 17/17 keyword-interlink checks, 40/40 DOM-stubbed
