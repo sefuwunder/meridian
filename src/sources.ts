@@ -939,6 +939,9 @@ export async function collectUrlscan(ctx: Ctx): Promise<SourceResult> {
     const ip = String(page.ip || "").trim();
     if (ip && !seen.has(`i:${ip}`)) {
       seen.add(`i:${ip}`);
+      // stash discovered IPs for the ipquery collector (runs later, enriches
+      // these same nodes with geo/ASN/risk intel via matching node ids)
+      if (/^[0-9a-fA-F.:]+$/.test(ip)) (ctx.facts.ips ||= []).push(ip);
       const iid = `urlscan:ip:${slug(ip)}`;
       nodes.push({
         id: iid, label: ip, type: "infra" as NodeType, subtype: "ip",
@@ -1085,6 +1088,203 @@ export async function collectOpenfec(ctx: Ctx): Promise<SourceResult> {
   };
 }
 
+// ---------- 22. ip intel (IPQuery.io) ----------
+// Keyless: GET https://api.ipquery.io/<ip>?format=json → { ip,
+// isp: { asn, org, isp }, location: { country, country_code, city, state,
+// zipcode, latitude, longitude }, risk: { is_mobile, is_vpn, is_tor,
+// is_proxy, is_datacenter, risk_score } }. No key, unlimited free tier.
+// Runs after urlscan and enriches the IPs urlscan discovered (stashed on
+// ctx.facts.ips): node ids reuse urlscan's `urlscan:ip:<slug>` ids so
+// mergeGraph folds the geo/ASN/risk detail into the existing nodes instead
+// of duplicating them. One request per IP, max 8 per recon.
+export async function collectIpquery(ctx: Ctx): Promise<SourceResult> {
+  const ips: string[] = Array.isArray(ctx.facts.ips) ? ctx.facts.ips : [];
+  if (!ips.length)
+    return { nodes: [], edges: [], note: "no IPs discovered by the web-scan source this run" };
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  for (const ip of ips.slice(0, 8)) {
+    let j: any;
+    try {
+      j = await fetchJson(`https://api.ipquery.io/${encodeURIComponent(ip)}?format=json`, {}, 15000);
+    } catch { continue; } // one bad IP never sinks the rest
+    if (!j || typeof j !== "object" || !j.ip) continue;
+    const loc = j.location && typeof j.location === "object" ? j.location : {};
+    const isp = j.isp && typeof j.isp === "object" ? j.isp : {};
+    const risk = j.risk && typeof j.risk === "object" ? j.risk : {};
+    const flags = ["is_vpn", "is_tor", "is_proxy", "is_datacenter"]
+      .filter((k) => risk[k] === true).map((k) => k.replace("is_", ""));
+    const geo = [loc.city, loc.country].filter(Boolean).join(", ");
+    const asn = [isp.asn, isp.org].filter(Boolean).join(" ");
+    const detail = [
+      geo || null, asn || null,
+      flags.length ? `risk: ${flags.join("/")}` : null,
+      typeof risk.risk_score === "number" && risk.risk_score > 0 ? `risk score ${risk.risk_score}` : null,
+    ].filter(Boolean).join(" · ").slice(0, 220);
+    nodes.push({
+      id: `urlscan:ip:${slug(ip)}`, label: ip, type: "infra" as NodeType, subtype: "ip",
+      source: "ipquery", detail: detail || undefined,
+    });
+    edges.push({ from: `urlscan:ip:${slug(ip)}`, to: ctx.cityId, label: "touches" });
+  }
+  return { nodes, edges, note: `${nodes.length} IPs enriched` };
+}
+
+// ---------- 23. banks (FDIC BankFind Suite) ----------
+// Keyless as of 2026-09-16 (verified live; FDIC has announced a Data.gov API
+// key requirement "beginning September 8th" — if that starts being enforced
+// this collector will fail gracefully until a key flow is added).
+// GET https://api.fdic.gov/banks/institutions?filters=...&fields=...&limit=..&format=json
+// Filter syntax is ElasticSearch query-string: CITY:"Springfield" AND STALP:IL.
+// Response: { meta: { total }, data: [ { data: { NAME, CITY, STALP, CERT,
+// ACTIVE, ASSET ($ thousands), WEBADDR } } ] }.
+// US-only: idles when the recon city has no US state code.
+export async function collectFdic(ctx: Ctx): Promise<SourceResult> {
+  if (!ctx.state)
+    return { nodes: [], edges: [], note: "US-only source — idle for non-US recon" };
+  const shortCity = ctx.city.split(",")[0].trim().replace(/"/g, "");
+  const q = `CITY:"${shortCity}" AND STALP:${ctx.state} AND ACTIVE:1`;
+  let j: any;
+  try {
+    j = await fetchJson(
+      `https://api.fdic.gov/banks/institutions?filters=${encodeURIComponent(q)}` +
+      `&fields=NAME,CITY,STALP,CERT,ACTIVE,ASSET,WEBADDR&limit=25&offset=0&format=json`, {}, 25000);
+  } catch (e) { throwIfRateLimited(e, "fdic"); }
+  const rows = Array.isArray(j?.data) ? j.data : [];
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  for (const r of rows) {
+    const d = r && typeof r === "object" && r.data && typeof r.data === "object" ? r.data : null;
+    if (!d) continue;
+    const cert = String(d.CERT || "").trim();
+    const name = String(d.NAME || "").trim();
+    if (!cert || !name || seen.has(cert)) continue;
+    seen.add(cert);
+    const assets = Number(d.ASSET); // FDIC reports $ thousands
+    const web = String(d.WEBADDR || "").trim();
+    const id = `fdic:inst:${slug(cert)}`;
+    nodes.push({
+      id, label: name.slice(0, 80), type: "org" as NodeType, subtype: "bank",
+      source: "fdic",
+      detail: [
+        `${String(d.CITY || "").trim()}, ${ctx.state}`,
+        Number.isFinite(assets) && assets > 0
+          ? `assets $${assets >= 1e6 ? (assets / 1e6).toFixed(1) + "B" : Math.round(assets / 1e3) + "M"}`
+          : "",
+        `FDIC cert ${cert}`,
+      ].filter(Boolean).join(" · "),
+      url: /^https?:\/\//i.test(web) ? web
+        : `https://banks.data.fdic.gov/bankfind-suite/bankfind?cert=${encodeURIComponent(cert)}`,
+    });
+    edges.push({ from: id, to: ctx.cityId, label: "in" });
+    if (nodes.length >= 20) break;
+  }
+  const total = Number(j?.meta?.total);
+  return {
+    nodes, edges,
+    note: `${nodes.length} FDIC-insured banks${Number.isFinite(total) ? ` (${total} total)` : ""}`,
+  };
+}
+
+// ---------- 24. web archive (Arquivo.pt) ----------
+// Keyless: GET https://arquivo.pt/textsearch?q=<terms>&maxItems=50 → JSON
+// with responseItems: [ { title, linkToArchive, linkToOriginalFile, tstamp } ].
+// Full-text search over the Portuguese/EU web archive — the recon city's
+// historic web presence. Parsed defensively: field names vary between API
+// versions, so every field has a fallback chain; a dead or reshaped endpoint
+// fails this collector gracefully, never the recon.
+export async function collectArquivo(ctx: Ctx): Promise<SourceResult> {
+  let j: any;
+  try {
+    j = await fetchJson(
+      `https://arquivo.pt/textsearch?q=${encodeURIComponent(ctx.city)}&maxItems=25`, {}, 30000);
+  } catch (e) { throwIfRateLimited(e, "arquivo"); }
+  const items = Array.isArray(j) ? j
+    : Array.isArray(j?.responseItems) ? j.responseItems
+    : Array.isArray(j?.items) ? j.items : [];
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  for (const it of items) {
+    if (!it || typeof it !== "object") continue;
+    const arch = String(it.linkToArchive || it.linkToOriginalFile || it.originalURL || it.url || "").trim();
+    const title = String(it.title || it.originalURL || "")
+      .replace(/<[^>]*>/g, "").trim();
+    if (!arch || seen.has(arch)) continue;
+    seen.add(arch);
+    const year = /(\d{4})/.exec(String(it.tstamp || it.date || ""))?.[1] || "";
+    const id = `arquivo:${slug(arch)}`;
+    nodes.push({
+      id, label: (title || "archived page").slice(0, 90),
+      type: "data" as NodeType, subtype: "web archive", source: "arquivo",
+      detail: year ? `captured ${year}` : "wayback capture",
+      url: arch,
+    });
+    edges.push({ from: id, to: ctx.cityId, label: "archived" });
+    if (nodes.length >= 12) break;
+  }
+  return { nodes, edges, note: `${nodes.length} archived pages` };
+}
+
+// ---------- 25. wireless networks (WiGLE) ----------
+// Keyed-free: free registration at wigle.net → the account page shows an API
+// name + API token. The pair is stored as one WIGLE_API_KEY value in
+// "ApiName:ApiToken" form (env var wins, then the Keys screen) and sent as
+// HTTP Basic auth.
+// GET https://api.wigle.net/api/v2/network/search?latrange1=..&latrange2=..
+// &longrange1=..&longrange2=..&resultsPerPage=100 → { success, totalResults,
+// results: [ { netid, ssid, trilat, trilong, channel, encryption } ] }.
+// Without a key the source idles (same pattern as OCCRP).
+export async function collectWigle(ctx: Ctx): Promise<SourceResult> {
+  const raw = resolveKey("WIGLE_API_KEY");
+  if (!raw)
+    return {
+      nodes: [], edges: [],
+      note: "idle — add free WiGLE API credentials on the Keys screen (top bar) to activate",
+    };
+  const ci = raw.indexOf(":");
+  if (ci <= 0) throw new Error("wigle: key must be in ApiName:ApiToken form");
+  const basic = Buffer.from(`${raw.slice(0, ci)}:${raw.slice(ci + 1)}`).toString("base64");
+  const { s, w, n, e } = ctx.bbox;
+  let j: any;
+  try {
+    j = await fetchJson(
+      `https://api.wigle.net/api/v2/network/search?latrange1=${s}&latrange2=${n}` +
+      `&longrange1=${w}&longrange2=${e}&resultsPerPage=100`,
+      { headers: { Authorization: `Basic ${basic}` } }, 30000);
+  } catch (e2) { throwIfRateLimited(e2, "wigle"); }
+  if (j && j.success === false)
+    throw new Error(`wigle: ${String(j.message || "search rejected").slice(0, 120)}`);
+  const results = Array.isArray(j?.results) ? j.results : [];
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  for (const r of results) {
+    if (!r || typeof r !== "object") continue;
+    const netid = String(r.netid || r.bssid || "").trim().toUpperCase();
+    if (!netid || seen.has(netid)) continue;
+    seen.add(netid);
+    const ssid = String(r.ssid || "").trim();
+    const lat = Number(r.trilat ?? r.latitude), lon = Number(r.trilong ?? r.longitude);
+    const id = `wigle:net:${slug(netid)}`;
+    nodes.push({
+      id, label: (ssid || netid).slice(0, 60),
+      type: "infra" as NodeType, subtype: "wifi", source: "wigle",
+      detail: [
+        netid,
+        r.channel ? `ch ${r.channel}` : "",
+        String(r.encryption || "").trim(),
+      ].filter(Boolean).join(" · ").slice(0, 120) || undefined,
+      lat: Number.isFinite(lat) ? lat : undefined,
+      lon: Number.isFinite(lon) ? lon : undefined,
+    });
+    edges.push({ from: id, to: ctx.cityId, label: "observed in" });
+    if (nodes.length >= 15) break;
+  }
+  const total = Number(j?.totalResults);
+  return {
+    nodes, edges,
+    note: `${nodes.length} wireless networks${Number.isFinite(total) ? ` (${total} in area)` : ""}`,
+  };
+}
+
 export const SOURCE_DEFS = [
   { key: "geocode", label: "Geocode · OpenStreetMap" },
   { key: "overpass", label: "Places · OpenStreetMap" },
@@ -1105,8 +1305,12 @@ export const SOURCE_DEFS = [
   { key: "icij", label: "Offshore leaks · ICIJ" },
   { key: "occrp", label: "Investigations · OCCRP Aleph" },
   { key: "urlscan", label: "Web scans · urlscan.io" },
+  { key: "ipquery", label: "IP intel · IPQuery" },
   { key: "nonprofits", label: "Nonprofits · ProPublica" },
   { key: "openfec", label: "Campaign finance · OpenFEC" },
+  { key: "fdic", label: "Banks · FDIC" },
+  { key: "arquivo", label: "Web archive · Arquivo.pt" },
+  { key: "wigle", label: "Wireless · WiGLE" },
 ];
 
 // ---------- keyword interlinking ----------
@@ -1349,6 +1553,16 @@ export async function probeKeySource(id: string, key: string): Promise<{ ok: boo
     const j = await fetchJson(`${FEC_BASE}/candidates/?api_key=${key}&per_page=1`, {}, 15000);
     const results = Array.isArray(j?.results) ? j.results : [];
     return { ok: true, detail: `authenticated — ${results.length ? "sample candidate returned" : "query accepted"}` };
+  }
+  if (id === "WIGLE_API_KEY") {
+    const ci = key.indexOf(":");
+    if (ci <= 0) throw new Error("use ApiName:ApiToken form");
+    const basic = Buffer.from(key).toString("base64");
+    const j = await fetchJson(
+      "https://api.wigle.net/api/v2/network/search?latrange1=40&latrange2=40.01&longrange1=-74&longrange2=-73.99&resultsPerPage=1",
+      { headers: { Authorization: `Basic ${basic}` } }, 15000);
+    if (j?.success === false) throw new Error(String(j.message || "rejected").slice(0, 120));
+    return { ok: true, detail: "authenticated — area search accepted" };
   }
   throw new Error(`no probe for key ${id}`);
 }

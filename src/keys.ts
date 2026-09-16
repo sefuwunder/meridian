@@ -38,6 +38,14 @@ export const KEY_DEFS: KeyDef[] = [
     signup: "https://api.open.fec.gov/developers",
     signupLabel: "free personal key at api.open.fec.gov",
   },
+  {
+    id: "WIGLE_API_KEY",
+    name: "WiGLE",
+    required: true,
+    benefit: "activates the wireless-networks source — wardriven Wi-Fi networks (SSID/BSSID locations) inside the recon area",
+    signup: "https://wigle.net/account",
+    signupLabel: "free API name + token at wigle.net/account (store as ApiName:ApiToken)",
+  },
 ];
 
 let cache: Record<string, string> | null = null;
