@@ -1285,6 +1285,190 @@ export async function collectWigle(ctx: Ctx): Promise<SourceResult> {
   };
 }
 
+// ---------- 26. ip ports/vulns (Shodan InternetDB) ----------
+// Keyless: GET https://internetdb.shodan.io/<ip> → { ip, hostnames,
+// domains, ports, cpes, tags, vulns }. No key, generous free tier; 404 for
+// unknown hosts. Runs after urlscan like IPQuery and enriches the IPs
+// urlscan discovered (ctx.facts.ips), reusing urlscan's `urlscan:ip:<slug>`
+// node ids so mergeGraph appends port/vuln detail to the existing IP nodes
+// instead of duplicating them. One request per IP, max 8 per recon.
+export async function collectInternetdb(ctx: Ctx): Promise<SourceResult> {
+  const ips: string[] = Array.isArray(ctx.facts.ips) ? ctx.facts.ips : [];
+  if (!ips.length)
+    return { nodes: [], edges: [], note: "no IPs discovered by the web-scan source this run" };
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  for (const ip of ips.slice(0, 8)) {
+    let j: any;
+    try {
+      j = await fetchJson(`https://internetdb.shodan.io/${encodeURIComponent(ip)}`, {}, 15000);
+    } catch { continue; } // 404 = unknown host; one bad IP never sinks the rest
+    if (!j || typeof j !== "object" || !j.ip) continue;
+    const ports = Array.isArray(j.ports)
+      ? j.ports.map((p: any) => Number(p)).filter((p: number) => Number.isFinite(p)) : [];
+    const hostnames = Array.isArray(j.hostnames) ? j.hostnames.map(String).filter(Boolean) : [];
+    const vulns = Array.isArray(j.vulns) ? j.vulns.map(String).filter(Boolean) : [];
+    const tags = Array.isArray(j.tags) ? j.tags.map(String).filter(Boolean) : [];
+    const detail = [
+      ports.length ? `open ports: ${ports.slice(0, 12).join(", ")}${ports.length > 12 ? "…" : ""}` : null,
+      hostnames.length ? hostnames.slice(0, 3).join(", ") : null,
+      vulns.length ? `${vulns.length} known vuln${vulns.length > 1 ? "s" : ""}: ${vulns.slice(0, 3).join(", ")}` : null,
+      tags.length ? `tags: ${tags.slice(0, 4).join(", ")}` : null,
+    ].filter(Boolean).join(" · ").slice(0, 240);
+    if (!detail) continue;
+    const id = `urlscan:ip:${slug(ip)}`;
+    nodes.push({
+      id, label: ip, type: "infra" as NodeType, subtype: "ip",
+      source: "internetdb", detail,
+    });
+    edges.push({ from: id, to: ctx.cityId, label: "touches" });
+  }
+  return { nodes, edges, note: `${nodes.length} IPs enriched` };
+}
+
+// ---------- 27. live aircraft (adsb.lol) ----------
+// Keyless: GET https://api.adsb.lol/v2/lat/<lat>/lon/<lon>/dist/<nm> →
+// { ac: [ { hex, flight, r (registration), t (type), alt_baro, gs, lat,
+// lon, ... } ] }. Community ADS-B feeder network, often better coverage
+// than OpenSky in some regions; complements (not replaces) the OpenSky
+// collector. 25nm radius around the city, max 15 aircraft per recon.
+export async function collectAdsblol(ctx: Ctx): Promise<SourceResult> {
+  let j: any;
+  try {
+    j = await fetchJson(
+      `https://api.adsb.lol/v2/lat/${ctx.lat.toFixed(3)}/lon/${ctx.lon.toFixed(3)}/dist/25`,
+      {}, 25000);
+  } catch (e) { throwIfRateLimited(e, "adsb.lol"); }
+  const ac = Array.isArray(j?.ac) ? j.ac : [];
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  for (const a of ac) {
+    if (!a || typeof a !== "object") continue;
+    const hex = String(a.hex || "").trim().toLowerCase();
+    if (!hex || seen.has(hex)) continue;
+    seen.add(hex);
+    const flight = String(a.flight || "").trim();
+    const reg = String(a.r || "").trim();
+    const atype = String(a.t || "").trim();
+    const alt = a.alt_baro == null ? NaN : Number(a.alt_baro);
+    const gs = a.gs == null ? NaN : Number(a.gs);
+    const lat = a.lat == null ? NaN : Number(a.lat);
+    const lon = a.lon == null ? NaN : Number(a.lon);
+    const id = `adsblol:ac:${slug(hex)}`;
+    nodes.push({
+      id, label: (flight || reg || hex.toUpperCase()).slice(0, 40),
+      type: "infra" as NodeType, subtype: "aircraft", source: "adsb.lol",
+      detail: [
+        reg && reg !== flight ? reg : null,
+        atype || null,
+        Number.isFinite(alt) ? `${Math.round(alt).toLocaleString("en-US")} ft` : null,
+        Number.isFinite(gs) ? `${Math.round(gs)} kt` : null,
+      ].filter(Boolean).join(" · ") || undefined,
+      lat: Number.isFinite(lat) ? lat : undefined,
+      lon: Number.isFinite(lon) ? lon : undefined,
+    });
+    edges.push({ from: id, to: ctx.cityId, label: "over" });
+    if (nodes.length >= 15) break;
+  }
+  return { nodes, edges, note: `${nodes.length} aircraft overhead (25nm)` };
+}
+
+// ---------- 28. natural events (NASA EONET) ----------
+// Keyless: GET https://eonet.gsfc.nasa.gov/api/v3/events?bbox=<w>,<s>,<e>,<n>
+// &status=open&limit=20 → { events: [ { id, title, categories: [{ title }],
+// geometry: [ { date, type, coordinates } ], link } ] }. Wildfires, storms,
+// volcanoes and other natural events currently active in the recon bbox.
+// Point geometries give lat/lon; polygons are kept without coordinates.
+export async function collectEonet(ctx: Ctx): Promise<SourceResult> {
+  const { s, w, n, e } = ctx.bbox;
+  let j: any;
+  try {
+    j = await fetchJson(
+      `https://eonet.gsfc.nasa.gov/api/v3/events?bbox=${w},${s},${e},${n}&status=open&limit=20`,
+      {}, 25000);
+  } catch (e2) { throwIfRateLimited(e2, "eonet"); }
+  const events = Array.isArray(j?.events) ? j.events : [];
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  for (const ev of events) {
+    if (!ev || typeof ev !== "object") continue;
+    const eid = String(ev.id || "").trim();
+    if (!eid || seen.has(eid)) continue;
+    seen.add(eid);
+    const title = String(ev.title || "natural event").trim();
+    const cats = Array.isArray(ev.categories)
+      ? ev.categories.map((c: any) => String(c?.title || c?.id || "")).filter(Boolean) : [];
+    const geoms = Array.isArray(ev.geometry) ? ev.geometry : [];
+    const pt = geoms.find((g: any) => g?.type === "Point" && Array.isArray(g?.coordinates));
+    const lon = pt ? Number(pt.coordinates[0]) : NaN;
+    const lat = pt ? Number(pt.coordinates[1]) : NaN;
+    const when = String(pt?.date ?? geoms[0]?.date ?? "").slice(0, 10);
+    const id = `eonet:evt:${slug(eid)}`;
+    nodes.push({
+      id, label: title.slice(0, 90),
+      type: "news" as NodeType, subtype: "natural event", source: "eonet",
+      detail: [cats[0] || null, when || null].filter(Boolean).join(" · ") || undefined,
+      url: String(ev.link || "").trim() ||
+        `https://eonet.gsfc.nasa.gov/api/v3/events/${encodeURIComponent(eid)}`,
+      lat: Number.isFinite(lat) ? lat : undefined,
+      lon: Number.isFinite(lon) ? lon : undefined,
+    });
+    edges.push({ from: id, to: ctx.cityId, label: "affects" });
+    if (nodes.length >= 15) break;
+  }
+  return { nodes, edges, note: `${nodes.length} open natural events in area` };
+}
+
+// ---------- 29. earthquakes (USGS FDSN) ----------
+// Keyless: GET https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson
+// &latitude=..&longitude=..&maxradiuskm=200&minmagnitude=2&limit=15&orderby=time
+// → GeoJSON FeatureCollection; each feature has id, properties { mag, place,
+// time, url }, geometry { coordinates: [lon, lat, depthKm] }. Complements the
+// GDACS disaster collector with authoritative seismic data.
+export async function collectUsgs(ctx: Ctx): Promise<SourceResult> {
+  let j: any;
+  try {
+    j = await fetchJson(
+      `https://earthquake.usgs.gov/fdsnws/event/1/query?format=geojson` +
+      `&latitude=${ctx.lat.toFixed(3)}&longitude=${ctx.lon.toFixed(3)}` +
+      `&maxradiuskm=200&minmagnitude=2&limit=15&orderby=time`, {}, 25000);
+  } catch (e) { throwIfRateLimited(e, "usgs"); }
+  const feats = Array.isArray(j?.features) ? j.features : [];
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  for (const f of feats) {
+    if (!f || typeof f !== "object") continue;
+    const fid = String(f.id || "").trim();
+    if (!fid || seen.has(fid)) continue;
+    seen.add(fid);
+    const p = f.properties && typeof f.properties === "object" ? f.properties : {};
+    const coords = f.geometry && Array.isArray(f.geometry.coordinates)
+      ? f.geometry.coordinates : [];
+    const mag = p.mag == null ? NaN : Number(p.mag);
+    const place = String(p.place || "").trim();
+    const t = p.time == null ? NaN : Number(p.time);
+    const when = Number.isFinite(t) ? new Date(t).toISOString().slice(0, 10) : "";
+    const depth = coords[2] == null ? NaN : Number(coords[2]);
+    const lat = coords[1] == null ? NaN : Number(coords[1]);
+    const lon = coords[0] == null ? NaN : Number(coords[0]);
+    const id = `usgs:quake:${slug(fid)}`;
+    nodes.push({
+      id,
+      label: `${Number.isFinite(mag) ? `M${mag.toFixed(1)}` : "quake"}${place ? ` — ${place}` : ""}`.slice(0, 90),
+      type: "news" as NodeType, subtype: "earthquake", source: "usgs",
+      detail: [
+        when || null,
+        Number.isFinite(depth) ? `${depth.toFixed(0)} km deep` : null,
+      ].filter(Boolean).join(" · ") || undefined,
+      url: String(p.url || "").trim() || undefined,
+      lat: Number.isFinite(lat) ? lat : undefined,
+      lon: Number.isFinite(lon) ? lon : undefined,
+    });
+    edges.push({ from: id, to: ctx.cityId, label: "affects" });
+    if (nodes.length >= 15) break;
+  }
+  return { nodes, edges, note: `${nodes.length} earthquakes within 200km` };
+}
+
 export const SOURCE_DEFS = [
   { key: "geocode", label: "Geocode · OpenStreetMap" },
   { key: "overpass", label: "Places · OpenStreetMap" },
@@ -1311,6 +1495,10 @@ export const SOURCE_DEFS = [
   { key: "fdic", label: "Banks · FDIC" },
   { key: "arquivo", label: "Web archive · Arquivo.pt" },
   { key: "wigle", label: "Wireless · WiGLE" },
+  { key: "internetdb", label: "IP ports/vulns · Shodan InternetDB" },
+  { key: "adsblol", label: "Live aircraft · adsb.lol" },
+  { key: "eonet", label: "Natural events · NASA EONET" },
+  { key: "usgs", label: "Earthquakes · USGS" },
 ];
 
 // ---------- keyword interlinking ----------

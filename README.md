@@ -3,10 +3,10 @@
 Land in a foreign city, launch a recon sprint, and watch social, cultural, and
 business intel assemble itself into an interactive web of connected nodes.
 
-`meridian` collects from **nineteen free, keyless sources** plus two optional
-keyed-free ones (OCCRP Aleph needs a free API key to activate; OpenFEC works
-out of the box on a low demo quota and accepts a free personal key for the
-full rate). It lays the results out as a force-directed node graph: the city
+`meridian` collects from **twenty-six free, keyless sources** plus three optional
+keyed-free ones (OCCRP Aleph and WiGLE need free API credentials to activate;
+OpenFEC works out of the box on a low demo quota and accepts a free personal
+key for the full rate). It lays the results out as a force-directed node graph: the city
 sits pinned at the hub, everything else — restaurants, museums, coworking
 spaces, embassies, hospitals, companies, legal entities, notable people,
 researchers, artists, headlines, live aircraft, currency, weather, local
