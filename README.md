@@ -60,6 +60,18 @@ the header tracks elapsed time.
 | 19 | urlscan.io | keyless search API: recent public web scans whose page URL mentions the city, expanded into domain → IP → ASN infra nodes with scan links and malicious-verdict flags. One request per recon (~30/min anonymous quota); HTTP 429 ends the source for the run, never retried. |
 | 20 | ProPublica Nonprofit Explorer v2 | keyless: IRS nonprofits actually based in the recon city (filtered on the org's city field), with NTEE category and 501(c) subsection. One request per recon. |
 | 21 | OpenFEC | keyed-free: campaign committees in the recon's US state plus itemized donors → person→committee "donated to" edges. Works on the built-in demo key at 30 req/hr; `OPENFEC_API_KEY` (env or Keys screen) raises the limit. Two requests per recon. |
+| 22 | IPQuery | keyless: geo/ASN/risk enrichment of the IPs urlscan discovered, folded into the existing IP nodes by matching ids. One request per IP, max 8 per recon. |
+| 23 | FDIC BankFind | keyless (as of 2026-09-16; FDIC has announced a future Data.gov key requirement): US banks in the recon city by CITY+STALP filter, with assets and FDIC cert. US-only. |
+| 24 | Arquivo.pt | keyless: Portuguese web-archive full-text search mentioning the city → archived page nodes. |
+| 25 | WiGLE | keyed-free: wireless networks in the recon bbox (SSID, encryption, location). Idles with a setup hint until a key is configured. |
+| 26 | Shodan InternetDB | keyless: port/hostname/vuln enrichment of urlscan-discovered IPs, folded into existing IP nodes. |
+| 27 | adsb.lol | keyless: live aircraft within 25 nm of the city (callsign, altitude, squawk). |
+| 28 | NASA EONET | keyless: natural events (wildfires, storms, volcanoes) in the recon bbox. |
+| 29 | USGS FDSN | keyless: earthquakes M2+ within 200 km of the city. |
+| 30 | HackerTarget | keyless plain-text API: reverse-IP hostnames, host search, and DNS records for urlscan-discovered IPs/domains. Hard cap of 8 requests per recon (free tier ~100 req/day). |
+| 31 | mnemonic PassiveDNS v3 | keyless: passive DNS answers (A/AAAA/CNAME) for up to 3 urlscan-discovered domains, top 15 by observation count. |
+| 32 | Cert Spotter | keyless cert-transparency: DNS names from certificate issuances for up to 3 domains (max 40 per domain) → subdomain nodes. |
+| 33 | brasilapi | keyless: Brazilian national holidays for BR recon; opportunistic CNPJ enrichment (only numbers with valid check digits found in recon facts) → org + partner nodes. Idles for non-Brazilian cities. |
 
 Every source is best-effort and independent: one dead API marks its row failed
 in the collection panel and the sprint continues. Nothing is ever half-merged —

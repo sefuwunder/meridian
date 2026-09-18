@@ -924,6 +924,9 @@ export async function collectUrlscan(ctx: Ctx): Promise<SourceResult> {
     const domain = String(page.domain || "").trim().toLowerCase();
     if (!domain || seen.has(`d:${domain}`)) continue;
     seen.add(`d:${domain}`);
+    // stash discovered domains for the hackertarget/mnemonic/certspotter
+    // collectors (run later, reuse urlscan's `urlscan:domain:<slug>` ids)
+    (ctx.facts.domains ||= []).push(domain);
     const did = `urlscan:domain:${slug(domain)}`;
     const scanId = String(r._id || "").trim();
     const v = verdicts.overall && typeof verdicts.overall === "object" ? verdicts.overall : {};
@@ -1469,6 +1472,305 @@ export async function collectUsgs(ctx: Ctx): Promise<SourceResult> {
   return { nodes, edges, note: `${nodes.length} earthquakes within 200km` };
 }
 
+// ---------- 30. infra recon (HackerTarget free API) ----------
+// Keyless plain-text GETs: reverseiplookup/?q=<ip> → hostnames on that IP,
+// hostsearch/?q=<domain> → "hostname,ip" CSV lines, dnslookup/?q=<domain> →
+// "TYPE : value" records. Free tier is tight (~100 req/day per source IP), so
+// caps are hard: 4 IPs + 2 domains × 2 lookups = max 8 requests per recon.
+// Works off the IPs/domains urlscan stashed on ctx.facts (idles when urlscan
+// found nothing). API error lines ("error check your search parameter",
+// "no records found", "no ptr records found") are treated as no-data for
+// that request — one bad request never sinks the rest.
+const HT_ERR_LINE = /^\s*(error|no (ptr |a )?records? found)/i;
+
+function htLines(t: string): string[] {
+  return t.split(/\r?\n/).map((l) => l.trim()).filter((l) => l && !HT_ERR_LINE.test(l));
+}
+
+export async function collectHackertarget(ctx: Ctx): Promise<SourceResult> {
+  const ips: string[] = Array.isArray(ctx.facts.ips) ? ctx.facts.ips : [];
+  const domains: string[] = Array.isArray(ctx.facts.domains) ? ctx.facts.domains : [];
+  if (!ips.length && !domains.length)
+    return { nodes: [], edges: [], note: "no IPs/domains discovered by the web-scan source this run" };
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  let requests = 0;
+  for (const ip of ips.slice(0, 4)) { // reverse lookup: who shares this IP
+    let lines: string[];
+    try {
+      requests++;
+      lines = htLines(await fetchText(`https://api.hackertarget.com/reverseiplookup/?q=${encodeURIComponent(ip)}`, {}, 15000));
+    } catch { continue; } // one bad request never sinks the rest
+    const iid = `urlscan:ip:${slug(ip)}`;
+    for (const host of lines.slice(0, 20)) {
+      const hid = `hackertarget:host:${slug(host)}`;
+      if (seen.has(hid)) continue;
+      seen.add(hid);
+      nodes.push({
+        id: hid, label: host.slice(0, 60), type: "infra" as NodeType, subtype: "host",
+        source: "hackertarget", detail: `shares IP ${ip}`,
+      });
+      edges.push({ from: hid, to: iid, label: "shares IP" });
+    }
+  }
+  for (const domain of domains.slice(0, 2)) {
+    let lines: string[];
+    try { // host search: all hosts the API knows under this domain
+      requests++;
+      lines = htLines(await fetchText(`https://api.hackertarget.com/hostsearch/?q=${encodeURIComponent(domain)}`, {}, 15000));
+    } catch { continue; }
+    for (const line of lines.slice(0, 25)) {
+      const [host, ip] = line.split(",").map((s) => s.trim());
+      if (!host || !ip || seen.has(`hackertarget:host:${slug(host)}`)) continue;
+      seen.add(`hackertarget:host:${slug(host)}`);
+      nodes.push({
+        id: `hackertarget:host:${slug(host)}`, label: host.slice(0, 60),
+        type: "infra" as NodeType, subtype: "host",
+        source: "hackertarget", detail: `found under ${domain}`,
+      });
+      edges.push({ from: `hackertarget:host:${slug(host)}`, to: `urlscan:ip:${slug(ip)}`, label: "resolves" });
+      nodes.push({
+        id: `urlscan:ip:${slug(ip)}`, label: ip, type: "infra" as NodeType, subtype: "ip",
+        source: "hackertarget", detail: "resolved by hostsearch",
+      });
+    }
+    try { // dns lookup: A/AAAA/MX/NS/TXT records
+      requests++;
+      lines = htLines(await fetchText(`https://api.hackertarget.com/dnslookup/?q=${encodeURIComponent(domain)}`, {}, 15000));
+    } catch { continue; }
+    const did = `urlscan:domain:${slug(domain)}`;
+    for (const line of lines.slice(0, 30)) {
+      const m = /^([A-Z]+)\s*:\s*(.+)$/.exec(line);
+      if (!m) continue;
+      const [_, type, val] = m;
+      if (type === "A" || type === "AAAA") {
+        nodes.push({
+          id: `urlscan:ip:${slug(val)}`, label: val, type: "infra" as NodeType, subtype: "ip",
+          source: "hackertarget", detail: `${type} record for ${domain}`,
+        });
+        edges.push({ from: did, to: `urlscan:ip:${slug(val)}`, label: "resolves" });
+      } else {
+        const rid = `hackertarget:dns:${slug(`${domain}-${type}-${val}`)}`;
+        if (seen.has(rid)) continue;
+        seen.add(rid);
+        nodes.push({
+          id: rid, label: `${type}: ${val}`.slice(0, 80), type: "infra" as NodeType, subtype: "record",
+          source: "hackertarget", detail: `DNS ${type} record for ${domain}`,
+        });
+        edges.push({ from: rid, to: did, label: "record of" });
+      }
+    }
+  }
+  return { nodes, edges, note: `${nodes.length} infra artifacts (${requests} requests)` };
+}
+
+// ---------- 31. passive DNS (mnemonic PassiveDNS v3) ----------
+// Keyless JSON: GET https://api.mnemonic.no/pdns/v3/{domain} →
+// { data: [ { query, answer, rrtype, times, firstSeenTimestamp,
+// lastSeenTimestamp } ] }. Queries the domains urlscan stashed on
+// ctx.facts.domains, cap 3 domains; keeps the top ~15 A/AAAA/CNAME answers by
+// observation count. Reuses urlscan's `urlscan:ip:<slug>` node ids so the
+// passive-DNS detail folds into the existing IP nodes instead of duplicating
+// them. Idles with a note when urlscan found no domains.
+export async function collectMnemonic(ctx: Ctx): Promise<SourceResult> {
+  const domains: string[] = Array.isArray(ctx.facts.domains) ? ctx.facts.domains : [];
+  if (!domains.length)
+    return { nodes: [], edges: [], note: "no domains discovered by the web-scan source this run" };
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  for (const domain of domains.slice(0, 3)) {
+    let j: any;
+    try {
+      j = await fetchJson(`https://api.mnemonic.no/pdns/v3/${encodeURIComponent(domain)}`, {}, 20000);
+    } catch (e) { throwIfRateLimited(e, "mnemonic"); continue; }
+    const records = Array.isArray(j?.data) ? j.data : [];
+    const did = `urlscan:domain:${slug(domain)}`;
+    const scored = records
+      .filter((r: any) => r && typeof r === "object" && ["A", "AAAA", "CNAME"].includes(String(r.rrtype || "").toUpperCase()))
+      .map((r: any) => ({
+        answer: String(r.answer || "").trim().replace(/\.$/, ""),
+        rrtype: String(r.rrtype || "").toUpperCase(),
+        times: Number(r.times) || 0,
+        lastSeen: Number(r.lastSeenTimestamp) || 0,
+      }))
+      .filter((r: any) => r.answer)
+      .sort((a: any, b: any) => b.times - a.times)
+      .slice(0, 15);
+    for (const r of scored) {
+      const last = r.lastSeen ? ` · last seen ${new Date(r.lastSeen).toISOString().slice(0, 10)}` : "";
+      const detail = `passive DNS: ${r.times.toLocaleString("en-US")} observations${last}`;
+      if (r.rrtype === "CNAME") {
+        const cid = `mnemonic:domain:${slug(r.answer)}`;
+        if (!seen.has(cid)) {
+          seen.add(cid);
+          nodes.push({
+            id: cid, label: r.answer.slice(0, 60), type: "infra" as NodeType, subtype: "domain",
+            source: "mnemonic", detail,
+          });
+        }
+        edges.push({ from: did, to: cid, label: "points to" });
+      } else {
+        nodes.push({
+          id: `urlscan:ip:${slug(r.answer)}`, label: r.answer,
+          type: "infra" as NodeType, subtype: "ip", source: "mnemonic", detail,
+        });
+        edges.push({ from: did, to: `urlscan:ip:${slug(r.answer)}`, label: "resolves" });
+      }
+    }
+  }
+  return { nodes, edges, note: `${nodes.length} passive-DNS answers` };
+}
+
+// ---------- 32. cert transparency (Cert Spotter) ----------
+// Keyless JSON: GET https://api.certspotter.com/v1/issuances
+// ?domain=<d>&include_subdomains=true&expand=dns_names →
+// [ { dns_names: [...], issuer?, not_before } ]. Builds subdomain nodes for
+// the domains urlscan stashed (cap 3 domains, 40 names each). Wildcards are
+// stripped to the base name; the parent domain itself is skipped; names that
+// are plain subdomains of the parent link to it, anything else links to the
+// city as cert-transparency context. Issuer org is noted when the API
+// exposes it (defensive — the field isn't always returned).
+export async function collectCertspotter(ctx: Ctx): Promise<SourceResult> {
+  const domains: string[] = Array.isArray(ctx.facts.domains) ? ctx.facts.domains : [];
+  if (!domains.length)
+    return { nodes: [], edges: [], note: "no domains discovered by the web-scan source this run" };
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  for (const domain of domains.slice(0, 3)) {
+    let j: any;
+    try {
+      j = await fetchJson(
+        `https://api.certspotter.com/v1/issuances?domain=${encodeURIComponent(domain)}` +
+        `&include_subdomains=true&expand=dns_names`, {}, 20000);
+    } catch (e) { throwIfRateLimited(e, "certspotter"); continue; }
+    const rows = Array.isArray(j) ? j : [];
+    const names = new Map<string, string>(); // name -> issuer hint
+    for (const r of rows) {
+      if (!r || typeof r !== "object") continue;
+      const iss = r.issuer && typeof r.issuer === "object"
+        ? String(r.issuer.o || r.issuer.organization || "").trim() : "";
+      const dns = Array.isArray(r.dns_names) ? r.dns_names : [];
+      for (const raw of dns) {
+        const name = String(raw || "").trim().toLowerCase().replace(/^\*\./, "").replace(/\.$/, "");
+        if (!name || name === domain || !/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/.test(name)) continue;
+        if (!names.has(name) && iss) names.set(name, iss);
+        else if (!names.has(name)) names.set(name, "");
+      }
+      if (names.size >= 40) break;
+    }
+    const did = `urlscan:domain:${slug(domain)}`;
+    for (const [name, iss] of names) {
+      if (seen.has(name)) continue;
+      seen.add(name);
+      nodes.push({
+        id: `certspotter:domain:${slug(name)}`, label: name.slice(0, 60),
+        type: "infra" as NodeType, subtype: "subdomain",
+        source: "certspotter",
+        detail: `certificate transparency${iss ? ` · issued by ${iss.slice(0, 50)}` : ""}`,
+      });
+      edges.push(name.endsWith(`.${domain}`)
+        ? { from: `certspotter:domain:${slug(name)}`, to: did, label: "subdomain of" }
+        : { from: `certspotter:domain:${slug(name)}`, to: ctx.cityId, label: "cert-linked" });
+    }
+  }
+  return { nodes, edges, note: `${nodes.length} cert-transparency DNS names` };
+}
+
+// ---------- 33. brazil data (brasilapi) ----------
+// Keyless REST at https://brasilapi.com.br. Design choice: a city recon has
+// no CNPJ numbers, so the corporate endpoint (/api/cnpj/v1/{cnpj}) can't be
+// used directly — instead:
+//   (a) Brazil recon (countryCode BR): /api/feriados/v1/{year} → national
+//       holiday data nodes (cultural/scheduling context for the city).
+//       DDD is deliberately NOT reverse-looked-up: there is no city→DDD
+//       endpoint, and scanning all ~68 DDD lists to match the city name
+//       would be a burst of requests for low signal.
+//   (b) Opportunistic CNPJ enrichment: any 14-digit string carrying a VALID
+//       CNPJ check digit, found in the recon's stashed facts, is enriched
+//       via /api/cnpj/v1/{cnpj} → org node (company, activity) + person
+//       nodes for QSA partners. Check-digit validation means junk numbers
+//       never trigger a request. Cap 2 per recon.
+// Non-Brazilian cities idle with a clear note.
+function validCnpj(d: string): boolean {
+  if (!/^\d{14}$/.test(d) || /^(\d)\1{13}$/.test(d)) return false;
+  const calc = (base: string, start: number) => {
+    let sum = 0, w = start;
+    for (const ch of base) { sum += Number(ch) * w; w = w === 2 ? 9 : w - 1; }
+    const r = sum % 11; return r < 2 ? 0 : 11 - r;
+  };
+  return calc(d.slice(0, 12), 5) === Number(d[12]) && calc(d.slice(0, 13), 6) === Number(d[13]);
+}
+
+export async function collectBrasilapi(ctx: Ctx): Promise<SourceResult> {
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  // (b) opportunistic CNPJ enrichment from any stashed facts
+  const candidates = new Set<string>();
+  for (const m of JSON.stringify(ctx.facts || {}).match(/\d{14}/g) || []) {
+    if (validCnpj(m)) candidates.add(m);
+    if (candidates.size >= 2) break;
+  }
+  for (const cnpj of candidates) {
+    let j: any;
+    try {
+      j = await fetchJson(`https://brasilapi.com.br/api/cnpj/v1/${cnpj}`, {}, 15000);
+    } catch (e) { throwIfRateLimited(e, "brasilapi"); continue; }
+    if (!j || typeof j !== "object" || !j.cnpj) continue;
+    const name = String(j.nome_fantasia || j.razao_social || "").trim();
+    if (!name) continue;
+    const oid = `brasilapi:org:${slug(cnpj)}`;
+    nodes.push({
+      id: oid, label: name.slice(0, 90), type: "org" as NodeType, subtype: "company",
+      source: "brasilapi",
+      detail: [
+        `CNPJ ${cnpj.replace(/(\d{2})(\d{3})(\d{3})(\d{4})(\d{2})/, "$1.$2.$3/$4-$5")}`,
+        String(j.cnae_fiscal_descricao || "").trim().slice(0, 60),
+        String(j.descricao_situacao_cadastral || "").trim(),
+      ].filter(Boolean).join(" · "),
+    });
+    edges.push({ from: oid, to: ctx.cityId, label: "cited in recon" });
+    const qsa = Array.isArray(j.qsa) ? j.qsa : [];
+    for (const p of qsa.slice(0, 5)) {
+      if (!p || typeof p !== "object") continue;
+      const pname = String(p.nome_socio || "").trim();
+      if (!pname) continue;
+      const pid = `brasilapi:person:${slug(pname)}`;
+      if (!nodes.some((n) => n.id === pid))
+        nodes.push({
+          id: pid, label: pname.slice(0, 90), type: "person" as NodeType, subtype: "partner",
+          source: "brasilapi", detail: String(p.qualificacao_socio || "partner").trim().slice(0, 60),
+        });
+      edges.push({ from: pid, to: oid, label: "partner in" });
+    }
+  }
+  // (a) national holidays for Brazilian cities
+  if (ctx.countryCode !== "BR")
+    return { nodes, edges, note: nodes.length
+      ? `${nodes.length} CNPJ orgs enriched · holidays are Brazil-only`
+      : "Brazil-only source — idle for non-Brazilian recon (no valid CNPJ found in facts)" };
+  const year = new Date().getFullYear();
+  let j: any;
+  try {
+    j = await fetchJson(`https://brasilapi.com.br/api/feriados/v1/${year}`, {}, 15000);
+  } catch (e) { throwIfRateLimited(e, "brasilapi"); }
+  const rows = Array.isArray(j) ? j : [];
+  let added = 0;
+  for (const h of rows) {
+    if (!h || typeof h !== "object") continue;
+    if (String(h.type || "").toLowerCase() !== "national") continue;
+    const name = String(h.name || "").trim();
+    const date = String(h.date || "").trim();
+    if (!name || !/^\d{4}-\d{2}-\d{2}$/.test(date)) continue;
+    nodes.push({
+      id: `brasilapi:holiday:${slug(date + "-" + name)}`,
+      label: `${name} · ${date.slice(5)}`, type: "data" as NodeType, subtype: "holiday",
+      source: "brasilapi", detail: `national holiday ${date}`,
+    });
+    edges.push({ from: `brasilapi:holiday:${slug(date + "-" + name)}`, to: ctx.cityId, label: "observed in" });
+    if (++added >= 15) break;
+  }
+  return { nodes, edges, note: `${added} national holidays ${year} · ${candidates.size} CNPJ checks` };
+}
+
 export const SOURCE_DEFS = [
   { key: "geocode", label: "Geocode · OpenStreetMap" },
   { key: "overpass", label: "Places · OpenStreetMap" },
@@ -1499,6 +1801,10 @@ export const SOURCE_DEFS = [
   { key: "adsblol", label: "Live aircraft · adsb.lol" },
   { key: "eonet", label: "Natural events · NASA EONET" },
   { key: "usgs", label: "Earthquakes · USGS" },
+  { key: "hackertarget", label: "Infra recon · HackerTarget" },
+  { key: "mnemonic", label: "Passive DNS · mnemonic" },
+  { key: "certspotter", label: "Cert transparency · Cert Spotter" },
+  { key: "brasilapi", label: "Brazil data · brasilapi" },
 ];
 
 // ---------- keyword interlinking ----------
