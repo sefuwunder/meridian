@@ -447,10 +447,50 @@ function gleifAddress(e: any): string {
     .filter(Boolean).join(", ").slice(0, 160);
 }
 
-function gleifParentLei(attrs: any, rel: "direct-parent" | "ultimate-parent"): string | null {
+export function gleifParentLei(attrs: any, rel: "direct-parent" | "ultimate-parent"): string | null {
   const rr = attrs?.relationships?.[rel]?.["relationship-record"];
   const id = rr?.relationship?.endNode?.id || rr?.endNode?.id || null;
   return typeof id === "string" && LEI_RE.test(id) ? id : null;
+}
+
+export function parseGleifRecord(rec: any): { lei: string; name: string; detail: string; url: string } | null {
+  const lei = String(rec?.id || "").toUpperCase();
+  if (!LEI_RE.test(lei)) return null;
+  const ent = rec?.attributes?.entity || {};
+  const name = String(ent?.legalName?.name || lei);
+  return {
+    lei,
+    name: name.slice(0, 90),
+    detail: [gleifAddress(ent), ent?.status ? `status ${ent.status}` : ""].filter(Boolean).join(" · "),
+    url: `https://search.gleif.org/#/record/${lei}`,
+  };
+}
+
+// Shared by the city-based collector and the name-search collector: push the
+// org node plus direct/ultimate parent nodes, deduped via `seen`.
+function pushGleifRecord(rec: any, seen: Set<string>, nodes: GNode[], edges: GEdge[],
+  cityId: string, edgeLabel: string, source: string): void {
+  const p = parseGleifRecord(rec);
+  if (!p || seen.has(p.lei)) return;
+  seen.add(p.lei);
+  const id = `gleif:${p.lei.toLowerCase()}`;
+  nodes.push({
+    id, label: p.name, type: "org" as NodeType, subtype: "legal entity",
+    source, detail: p.detail, url: p.url,
+  });
+  edges.push({ from: id, to: cityId, label: edgeLabel });
+  for (const rel of ["direct-parent", "ultimate-parent"] as const) {
+    const plei = gleifParentLei(rec?.attributes, rel);
+    if (!plei || plei === p.lei || seen.has(plei)) continue;
+    seen.add(plei);
+    const pid = `gleif:${plei.toLowerCase()}`;
+    nodes.push({
+      id: pid, label: plei, type: "org" as NodeType, subtype: "parent entity",
+      source, detail: `${rel.replace("-", " ")} of ${p.name.slice(0, 60)} (name not fetched)`,
+      url: `https://search.gleif.org/#/record/${plei}`,
+    });
+    edges.push({ from: id, to: pid, label: rel.replace("-", " ") });
+  }
 }
 
 export async function collectGleif(ctx: Ctx): Promise<SourceResult> {
@@ -460,33 +500,8 @@ export async function collectGleif(ctx: Ctx): Promise<SourceResult> {
   const records = Array.isArray(j?.data) ? j.data : [];
   const nodes: GNode[] = [], edges: GEdge[] = [];
   const seen = new Set<string>();
-  for (const rec of records.slice(0, 40)) {
-    const lei = String(rec?.id || "").toUpperCase();
-    if (!LEI_RE.test(lei) || seen.has(lei)) continue;
-    seen.add(lei);
-    const ent = rec?.attributes?.entity || {};
-    const name = String(ent?.legalName?.name || lei);
-    const id = `gleif:${lei.toLowerCase()}`;
-    nodes.push({
-      id, label: name.slice(0, 90), type: "org" as NodeType, subtype: "legal entity",
-      source: "gleif",
-      detail: [gleifAddress(ent), ent?.status ? `status ${ent.status}` : ""].filter(Boolean).join(" · "),
-      url: `https://search.gleif.org/#/record/${lei}`,
-    });
-    edges.push({ from: id, to: ctx.cityId, label: "registered in" });
-    for (const rel of ["direct-parent", "ultimate-parent"] as const) {
-      const plei = gleifParentLei(rec?.attributes, rel);
-      if (!plei || plei === lei || seen.has(plei)) continue;
-      seen.add(plei);
-      const pid = `gleif:${plei.toLowerCase()}`;
-      nodes.push({
-        id: pid, label: plei, type: "org" as NodeType, subtype: "parent entity",
-        source: "gleif", detail: `${rel.replace("-", " ")} of ${name.slice(0, 60)} (name not fetched)`,
-        url: `https://search.gleif.org/#/record/${plei}`,
-      });
-      edges.push({ from: id, to: pid, label: rel.replace("-", " ") });
-    }
-  }
+  for (const rec of records.slice(0, 40))
+    pushGleifRecord(rec, seen, nodes, edges, ctx.cityId, "registered in", "gleif");
   return {
     nodes, edges,
     note: `${nodes.length} legal entities`,
@@ -1771,6 +1786,233 @@ export async function collectBrasilapi(ctx: Ctx): Promise<SourceResult> {
   return { nodes, edges, note: `${added} national holidays ${year} · ${candidates.size} CNPJ checks` };
 }
 
+// ---------- 34. legal-entity name search (GLEIF) ----------
+// The city-based GLEIF collector (#12) finds entities by registered address.
+// This one searches by NAME: company-name keywords derived from the recon's
+// stashed domains (urlscan etc.) are looked up via GLEIF's
+// filter[entity.legalName] — keyless, CC0. Cap: 3 keywords x 1 request.
+// Matches link to the city hub and back to the domain node whose name they
+// matched (urlscan:domain:<slug> ids are reused by convention).
+export interface CompanyKeyword { kw: string; domain: string }
+
+export function companyKeywordPairs(ctx: Ctx, cap = 3): CompanyKeyword[] {
+  const domains: string[] = Array.isArray(ctx.facts?.domains) ? ctx.facts.domains : [];
+  const out: CompanyKeyword[] = [];
+  const seen = new Set<string>();
+  for (const d of domains) {
+    const label = String(d || "").toLowerCase().split(".").slice(-2)[0] || "";
+    for (const kw of extractKeywords(label)) {
+      if (kw.length < 4 || seen.has(kw)) continue;
+      seen.add(kw);
+      out.push({ kw, domain: String(d) });
+      if (out.length >= cap) return out;
+    }
+  }
+  return out;
+}
+
+export async function collectGleifName(ctx: Ctx): Promise<SourceResult> {
+  const pairs = companyKeywordPairs(ctx, 3);
+  if (!pairs.length)
+    return { nodes: [], edges: [], note: "no company keywords — no domains stashed this run" };
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  for (const { kw, domain } of pairs) {
+    let j: any;
+    try {
+      j = await fetchJson(
+        `https://api.gleif.org/api/v1/lei-records?filter[entity.legalName]=${encodeURIComponent(kw)}&page[size]=10`,
+        {}, 25000);
+    } catch (e) { throwIfRateLimited(e, "gleif-name"); continue; }
+    const records = Array.isArray(j?.data) ? j.data : [];
+    for (const rec of records.slice(0, 10)) {
+      const p = parseGleifRecord(rec);
+      if (!p || seen.has(p.lei)) continue;
+      const id = `gleif:${p.lei.toLowerCase()}`;
+      pushGleifRecord(rec, seen, nodes, edges, ctx.cityId, "name match", "gleif-name");
+      edges.push({ from: id, to: `urlscan:domain:${slug(domain)}`, label: "name matches domain" });
+    }
+  }
+  return {
+    nodes, edges,
+    note: `${nodes.length} entities matching ${pairs.map((p) => p.kw).join(", ")}`,
+  };
+}
+
+// ---------- 35. SEC filers (EDGAR) ----------
+// Keyless. Two-step: (1) EFTS full-text search-index for the company keyword
+// (quoted phrase) → filer CIKs from the top hits; (2) data.sec.gov
+// submissions JSON per CIK → org node with legal name, tickers, SIC and
+// business address. SEC asks for a descriptive User-Agent and modest rates —
+// we send one and stay far under 10 req/s. Cap: 2 keywords x (1 + 3) requests.
+const SEC_UA = "meridian-osint/1.0 (local recon tool; research use)";
+
+export function eftsFilers(s: any, cap = 3): { cik: string; name: string }[] {
+  const hits = Array.isArray(s?.hits?.hits) ? s.hits.hits : [];
+  const out: { cik: string; name: string }[] = [];
+  const seen = new Set<string>();
+  for (const h of hits) {
+    const src = h?._source || {};
+    const ciks: any[] = Array.isArray(src.ciks) ? src.ciks : [];
+    const names: any[] = Array.isArray(src.display_names) ? src.display_names : [];
+    ciks.forEach((c: any, i: number) => {
+      const cik = String(c || "").replace(/\D/g, "").padStart(10, "0");
+      if (!/^\d{10}$/.test(cik) || /^0{10}$/.test(cik) || seen.has(cik)) return;
+      seen.add(cik);
+      const raw = String(names[i] ?? names[0] ?? "");
+      out.push({ cik, name: raw.split(/\s+\(CIK/i)[0].trim() });
+    });
+    if (out.length >= cap) break;
+  }
+  return out.slice(0, cap);
+}
+
+export function parseSecFiler(cik: string, fallbackName: string, sub: any): GNode | null {
+  if (!sub || typeof sub !== "object") return null;
+  const name = String(sub.name || fallbackName || "").trim();
+  if (!name) return null;
+  const tickers = [...new Set((Array.isArray(sub.tickers) ? sub.tickers : []).map((t: any) => String(t || "").trim()).filter(Boolean))];
+  const biz = sub.addresses && typeof sub.addresses === "object" ? sub.addresses.business || {} : {};
+  const addr = [biz.city, biz.stateOrCountry].filter(Boolean).join(", ");
+  return {
+    id: `secedgar:${cik}`,
+    label: name.slice(0, 90),
+    type: "org" as NodeType,
+    subtype: "SEC filer",
+    source: "sec-edgar",
+    detail: [
+      `CIK ${cik}`,
+      tickers.length ? `ticker ${tickers.slice(0, 4).join("/")}` : "",
+      String(sub.sicDescription || "").trim(),
+      addr,
+    ].filter(Boolean).join(" · "),
+    url: `https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=${cik}&type=&dateb=&owner=include&count=40`,
+  };
+}
+
+export function secNameMatches(legalName: string, kw: string): boolean {
+  const n = legalName.trim().toLowerCase(), k = kw.trim().toLowerCase();
+  return !!n && !!k && n.includes(k);
+}
+
+export async function collectSecEdgar(ctx: Ctx): Promise<SourceResult> {
+  const pairs = companyKeywordPairs(ctx, 2);
+  if (!pairs.length)
+    return { nodes: [], edges: [], note: "no company keywords — no domains stashed this run" };
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  let dropped = 0;
+  for (const { kw, domain } of pairs) {
+    let s: any;
+    try {
+      s = await fetchJson(
+        `https://efts.sec.gov/LATEST/search-index?q=${encodeURIComponent(`"${kw}"`)}`,
+        { headers: { "User-Agent": SEC_UA } }, 25000);
+    } catch (e) { throwIfRateLimited(e, "sec-edgar"); continue; }
+    for (const { cik, name } of eftsFilers(s, 3)) {
+      if (seen.has(cik)) continue;
+      seen.add(cik);
+      let sub: any;
+      try {
+        sub = await fetchJson(
+          `https://data.sec.gov/submissions/CIK${cik}.json`,
+          { headers: { "User-Agent": SEC_UA } }, 20000);
+      } catch (e) { throwIfRateLimited(e, "sec-edgar"); continue; }
+      const node = parseSecFiler(cik, name, sub);
+      if (!node) continue;
+      // EFTS matches filing *text*, so a hit can be a company whose filings
+      // merely mention the keyword (e.g. a 13F holding the stock). Only keep
+      // filers whose own legal name contains the keyword — otherwise the
+      // "name matches domain" edge below would be a lie.
+      const legalName = String(sub?.name || name || "").toLowerCase();
+      if (!secNameMatches(legalName, kw)) { dropped++; continue; }
+      nodes.push(node);
+      edges.push({ from: node.id, to: ctx.cityId, label: "name match" });
+      edges.push({ from: node.id, to: `urlscan:domain:${slug(domain)}`, label: "name matches domain" });
+    }
+  }
+  return {
+    nodes, edges,
+    note: `${nodes.length} SEC filers for ${pairs.map((p) => p.kw).join(", ")}` +
+      (dropped ? ` (${dropped} filing-text-only mention${dropped === 1 ? "" : "s"} excluded)` : ""),
+  };
+}
+
+// ---------- 36. organization name search (Wikidata) ----------
+// Keyless. wbsearchentities for the company keyword, then ONE batched
+// wbgetentities call (claims+labels+descriptions) per keyword; an item becomes
+// an org node only when one of its direct P31 (instance of) values is a known
+// organization class. Deliberately no SPARQL here: the transitive
+// P31/P279* path query 502s or takes 20s+ on the public endpoint, while the
+// MediaWiki API answers in ~3s. Trade-off: rarer org subclasses are missed
+// (false negatives), but nothing non-org slips in.
+const WD_ORG_CLASSES = new Set([
+  "Q43229", // organization
+  "Q4830453", // business
+  "Q891723", // public company
+  "Q6881511", // enterprise
+  "Q167037", // corporation
+  "Q18388277", // technology company
+]);
+
+export function parseWikidataOrgEntity(qid: string, e: any): { qid: string; label: string; desc: string } | null {
+  if (!/^Q\d+$/.test(qid) || !e || typeof e !== "object" || e.missing) return null;
+  const p31: string[] = ((e.claims || {}).P31 || [])
+    .map((cl: any) => cl?.mainsnak?.datavalue?.value?.id)
+    .filter((id: any) => typeof id === "string");
+  if (!p31.some((id) => WD_ORG_CLASSES.has(id))) return null;
+  const label = String(e.labels?.en?.value || "").trim();
+  if (!label) return null;
+  const desc = String(e.descriptions?.en?.value || "").trim().slice(0, 120);
+  return { qid, label: label.slice(0, 90), desc };
+}
+
+export async function collectWikidataOrg(ctx: Ctx): Promise<SourceResult> {
+  const pairs = companyKeywordPairs(ctx, 3);
+  if (!pairs.length)
+    return { nodes: [], edges: [], note: "no company keywords — no domains stashed this run" };
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  for (const { kw, domain } of pairs) {
+    let s: any;
+    try {
+      s = await fetchJson(
+        `https://www.wikidata.org/w/api.php?action=wbsearchentities&search=${encodeURIComponent(kw)}` +
+        `&language=en&format=json&type=item&limit=10`, {}, 20000);
+    } catch (e) { throwIfRateLimited(e, "wikidata-org"); continue; }
+    const qids = (Array.isArray(s?.search) ? s.search : [])
+      .map((r: any) => String(r?.id || ""))
+      .filter((id: string) => /^Q\d+$/.test(id) && !seen.has(id))
+      .slice(0, 10);
+    if (!qids.length) continue;
+    let e: any;
+    try {
+      e = await fetchJson(
+        `https://www.wikidata.org/w/api.php?action=wbgetentities&ids=${qids.join("|")}` +
+        `&props=claims|labels|descriptions&languages=en&languagefallback=1&format=json`,
+        {}, 25000);
+    } catch (err) { throwIfRateLimited(err, "wikidata-org"); continue; }
+    const entities = (e && typeof e === "object" && e.entities) || {};
+    for (const qid of qids) {
+      const p = parseWikidataOrgEntity(qid, entities[qid]);
+      if (!p || seen.has(p.qid)) continue;
+      seen.add(p.qid);
+      const id = `wd:org:${slug(p.label)}`;
+      nodes.push({
+        id, label: p.label, type: "org" as NodeType, subtype: "organization",
+        source: "wikidata-org", detail: p.desc,
+        url: `https://www.wikidata.org/wiki/${p.qid}`,
+      });
+      edges.push({ from: id, to: ctx.cityId, label: "name match" });
+      edges.push({ from: id, to: `urlscan:domain:${slug(domain)}`, label: "name matches domain" });
+    }
+  }
+  return {
+    nodes, edges,
+    note: `${nodes.length} organizations for ${pairs.map((p) => p.kw).join(", ")}`,
+  };
+}
+
 export const SOURCE_DEFS = [
   { key: "geocode", label: "Geocode · OpenStreetMap" },
   { key: "overpass", label: "Places · OpenStreetMap" },
@@ -1805,6 +2047,9 @@ export const SOURCE_DEFS = [
   { key: "mnemonic", label: "Passive DNS · mnemonic" },
   { key: "certspotter", label: "Cert transparency · Cert Spotter" },
   { key: "brasilapi", label: "Brazil data · brasilapi" },
+  { key: "gleifname", label: "Entity search · GLEIF" },
+  { key: "secedgar", label: "Filers · SEC EDGAR" },
+  { key: "wikidataorg", label: "Organizations · Wikidata" },
 ];
 
 // ---------- keyword interlinking ----------

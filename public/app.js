@@ -1356,6 +1356,11 @@ function renderSourceChecks() {
     ["gdacs", "disasters"], ["chronicling", "historic press"],
     ["icij", "offshore leaks"], ["occrp", "investigations"], ["urlscan", "web scans"],
     ["nonprofits", "nonprofits"], ["openfec", "campaign finance"],
+    ["ipquery", "IP intel"], ["fdic", "banks"], ["arquivo", "web archive"], ["wigle", "wireless"],
+    ["internetdb", "IP ports/vulns"], ["adsblol", "live aircraft"], ["eonet", "natural events"],
+    ["usgs", "earthquakes"], ["hackertarget", "infra recon"], ["mnemonic", "passive DNS"],
+    ["certspotter", "cert transparency"], ["brasilapi", "brazil data"],
+    ["gleifname", "entity search"], ["secedgar", "SEC filers"], ["wikidataorg", "organizations"],
   ];
   for (const [key, label] of defs) {
     const l = document.createElement("label");

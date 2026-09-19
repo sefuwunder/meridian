@@ -16,6 +16,7 @@ import {
   collectIpquery, collectFdic, collectArquivo, collectWigle,
   collectInternetdb, collectAdsblol, collectEonet, collectUsgs,
   collectHackertarget, collectMnemonic, collectCertspotter, collectBrasilapi,
+  collectGleifName, collectSecEdgar, collectWikidataOrg,
   probeKeySource,
   type Ctx, type GNode, type GEdge, type SourceResult,
 } from "./sources";
@@ -68,6 +69,9 @@ const COLLECTORS: Record<string, (ctx: Ctx) => Promise<SourceResult>> = {
   mnemonic: collectMnemonic,
   certspotter: collectCertspotter,
   brasilapi: collectBrasilapi,
+  gleifname: collectGleifName,
+  secedgar: collectSecEdgar,
+  wikidataorg: collectWikidataOrg,
 };
 
 // Interlink the graph: any two non-city nodes sharing a keyword get an edge.
