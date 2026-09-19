@@ -213,6 +213,9 @@ POST /api/recon            { city, sources? } → { id }          # launch (back
 GET  /api/recon                                            # list recons
 GET  /api/recon/:id                                        # full graph + source states + progress
 DEL  /api/recon/:id
+POST /api/runs             { city, sources?, label?, callback_url?, callback_headers? } → 202 { run_id, status }
+GET  /api/runs                                             # newest-first run list
+GET  /api/runs/:id                                         # run status, progress, per-source states, result
 POST /api/recon/:id/notes  { label, body, link_to? } → { node }
 POST /api/recon/:id/deep-search { nodeId } → { addedNodes, addedEdges, keywords }
 GET  /api/recon/:id/export                                 # JSON download
@@ -232,6 +235,70 @@ POST /api/graph/deep-search { nodes, edges, nodeId, city, country? } # deep sear
 
 Recons persist in `data/meridian.db` (SQLite via `bun:sqlite`, gitignored).
 Case files persist in `data/cases/` (JSON, gitignored).
+
+## Run-request router (outside consumers)
+
+The router lets trusted local programs (e.g. Milton) request recon runs
+programmatically. A run is a recon plus router metadata: it goes through the
+same collectors, but router runs execute **one at a time, FIFO**. A second
+`POST` while one is active returns `{ status: "queued" }` and starts when the
+first finishes. There is **no auth** — bind to localhost and treat the router
+as a trusted-local interface.
+
+Request a run and get called back on completion:
+
+```bash
+curl -s -X POST http://localhost:3005/api/runs \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "city": "Madisonville, Cincinnati, OH",
+    "sources": ["geocode", "wikipedia", "business"],
+    "label": "milton nightly",
+    "callback_url": "http://localhost:4010/hooks/meridian",
+    "callback_headers": { "X-Hook-Secret": "s3cr3t" }
+  }'
+# → 202 { "run_id": "run_m3...", "status": "running" }
+```
+
+Then poll for the result:
+
+```bash
+curl -s http://localhost:3005/api/runs/run_m3... | bun -e '
+  const r = JSON.parse(await new Response(Bun.stdin.stream()).text()).run;
+  console.log(r.status, JSON.stringify(r.result));'
+# → ready { "nodes": 42, "edges": 61,
+#     "recon_url": "http://localhost:3005/api/recon/r...",
+#     "export_url": "http://localhost:3005/api/recon/r.../export" }
+```
+
+Contract:
+
+- `POST /api/runs` → `202 { run_id, status }` (`running` or `queued`).
+  `city` is required; `sources` is filtered against the known collector keys
+  (unknown keys are dropped, `geocode` always runs first); `label` is an
+  optional tag (≤120 chars).
+- `callback_url` must be `http(s)`, else 400. `callback_headers` is an
+  optional object with the same strict rules as webhook headers: RFC token
+  names, ≤20 headers, name/value ≤2KB each, no CR/LF, and framing headers
+  (`Host`, `Content-Length`, `Connection`, `Transfer-Encoding`) are rejected
+  with 400.
+- `GET /api/runs` → newest-first `{ run_id, city, label, status, created_at,
+  started_at, finished_at, nodes, edges }`.
+- `GET /api/runs/:id` → full status: `progress`, per-source `sources`
+  states, and when finished a `result` summary `{ nodes, edges, recon_url,
+  export_url }`. Callback header **values** are never exposed — `callback`
+  shows only the header names, plus delivery `state` (`skipped`/`delivered`/
+  `failed`), `http_status`, and `attempted_at`.
+- Completion callback: when the run finishes (`ready`, `partial`, or
+  `failed`), the router POSTs one attempt (15s timeout, no retry) to
+  `callback_url`:
+  `{ run_id, city, label, status, nodes, edges, result_url, export_url }`
+  with the custom headers merged in (custom wins, framing headers stripped).
+  The delivery outcome is recorded on the run; a failed callback never fails
+  the run.
+- Runs persist in the `runs` table in `data/meridian.db`. On boot, runs left
+  in `running`/`queued` by a previous process return to `queued` and resume —
+  never silently dropped, never run twice concurrently.
 
 ## Notes
 

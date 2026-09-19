@@ -6,6 +6,9 @@ import {
   createRecon, getRecon, listRecons, updateRecon, deleteRecon, fullRecon,
 } from "./db";
 import {
+  initRouter, setRouterBase, requestRun, validateRunInput, listRuns, runDetail,
+} from "./router";
+import {
   SOURCE_DEFS, mergeGraph, addKeywordEdges, cityExcludeTokens, deepSearchNode,
   collectGeocode, collectOverpass, collectWikipedia,
   collectBusiness, collectPeople, collectMusic, collectNews,
@@ -300,6 +303,25 @@ const server = Bun.serve({
         });
       }
 
+      // ---------- run router (outside consumers: milton, etc.) ----------
+      // A "run" is a recon plus router metadata. Runs execute one at a
+      // time, FIFO; on completion a callback POST fires if one was given.
+      // No auth — for trusted local consumers only.
+      if (path === "/api/runs" && method === "POST") {
+        let v;
+        try { v = validateRunInput(await readBody(req)); }
+        catch (e: any) { return json({ error: String(e?.message || e).slice(0, 200) }, 400); }
+        setRouterBase(new URL(req.url).origin);
+        return json(requestRun(v), 202);
+      }
+      if (path === "/api/runs" && method === "GET") return json({ runs: listRuns() });
+      const runMatch = path.match(/^\/api\/runs\/([A-Za-z0-9_-]+)$/);
+      if (runMatch && method === "GET") {
+        const d = runDetail(runMatch[1], new URL(req.url).origin);
+        if (!d) return json({ error: "not found" }, 404);
+        return json({ run: d });
+      }
+
       // ---------- recons ----------
       if (path === "/api/recon" && method === "GET") return json({ recons: listRecons() });
       if (path === "/api/recon" && method === "POST") {
@@ -409,3 +431,10 @@ function contentType(p: string): string {
 }
 
 console.log(`meridian listening on http://localhost:${server.port}`);
+
+// Run-request router: outside consumers (milton, ...) request recon runs
+// here. Stale runs from a previous process are re-queued, never dropped.
+initRouter({
+  starter: (reconId, city, wanted) => runRecon(reconId, city, wanted),
+  base: `http://localhost:${PORT}`,
+});
