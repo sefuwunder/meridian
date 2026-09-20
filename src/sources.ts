@@ -6,6 +6,7 @@
 // kills the recon).
 
 import { resolveKey } from "./keys";
+import { enrichCompanySite } from "./enrich";
 
 export type NodeType =
   | "city" | "place" | "culture" | "org" | "infra"
@@ -2181,6 +2182,52 @@ export async function collectEnhetsregisteret(ctx: Ctx): Promise<SourceResult> {
   return { nodes, edges, note: `${nodes.length} entities in kommune ${knr}` };
 }
 
+// ---------- 39. company enrichment (own-site scrape + principal contacts) ----------
+// Keyword-driven like the other business sources: the first stashed company
+// domain is scraped (its own public pages only — /team, /about, …) for the
+// company profile and principal contacts, then the keyless registries
+// (GLEIF / SEC EDGAR / Wikidata orgs) are folded in for the same domain.
+// Budget-capped and best-effort: a slow site degrades to a note, never a
+// failed recon. Registry org nodes are linked back to the enriched company.
+export async function collectEnrich(ctx: Ctx): Promise<SourceResult> {
+  const pairs = companyKeywordPairs(ctx, 1);
+  if (!pairs.length)
+    return { nodes: [], edges: [], note: "no company keywords — no domains stashed this run" };
+  const domain = pairs[0].domain;
+  const cid = `enrich:company:${slug(domain)}`;
+  let nodes: GNode[] = [], edges: GEdge[] = [];
+  let principalCount = 0, companyName = domain, scrapeNote = "";
+  try {
+    const r = await enrichCompanySite(domain, { budgetMs: 45000 });
+    ({ nodes, edges } = mergeGraph({ nodes, edges }, r));
+    principalCount = r.result.principals.length;
+    companyName = r.result.company.name;
+    if (r.result.notes.length) scrapeNote = r.result.notes.join("; ");
+  } catch (e: any) {
+    return {
+      nodes: [], edges: [],
+      note: `enrich failed for ${domain}: ${String(e?.message || e).slice(0, 100)}`,
+    };
+  }
+  const sub: Ctx = { ...ctx, facts: { ...(ctx.facts || {}), domains: [domain] } };
+  for (const fn of [collectGleifName, collectSecEdgar, collectWikidataOrg]) {
+    try {
+      const before = new Set(nodes.map((n) => n.id));
+      const rr = await fn(sub);
+      ({ nodes, edges } = mergeGraph({ nodes, edges }, rr));
+      for (const n of nodes) {
+        if (!before.has(n.id) && n.type === "org")
+          edges.push({ from: n.id, to: cid, label: "registry match" });
+      }
+    } catch { /* best-effort: one dead registry never kills the enrichment */ }
+  }
+  const ps = principalCount === 1 ? "1 principal" : `${principalCount} principals`;
+  return {
+    nodes, edges,
+    note: `${companyName}: ${ps} · registries folded in` + (scrapeNote ? ` (${scrapeNote})` : ""),
+  };
+}
+
 export const SOURCE_DEFS = [
   { key: "geocode", label: "Geocode · OpenStreetMap" },
   { key: "overpass", label: "Places · OpenStreetMap" },
@@ -2220,6 +2267,7 @@ export const SOURCE_DEFS = [
   { key: "wikidataorg", label: "Organizations · Wikidata" },
   { key: "hkcr", label: "HK companies · Companies Registry" },
   { key: "enhetsregisteret", label: "Norwegian entities · Enhetsregisteret" },
+  { key: "enrich", label: "Enrichment · company principals" },
 ];
 
 // ---------- keyword interlinking ----------

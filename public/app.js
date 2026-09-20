@@ -1371,6 +1371,7 @@ async function renderSourceChecks() {
     ["certspotter", "cert transparency"], ["brasilapi", "brazil data"],
     ["gleifname", "entity search"], ["secedgar", "SEC filers"], ["wikidataorg", "organizations"],
     ["hkcr", "HK companies"], ["enhetsregisteret", "norwegian entities"],
+    ["enrich", "company principals"],
   ];
   for (const [key, label] of items) {
     const l = document.createElement("label");
@@ -1416,6 +1417,6 @@ if (document.readyState === "loading") document.addEventListener("DOMContentLoad
 else boot();
 
 // test seam
-window.__meridian = { S, COLORS, syncGraph, tick, draw, applyFilters, searchNodes, hitNode, hitGroup, centerOn, fit, w2s, s2w, selectNode, radiusFor, wake, kick, loop, truncLabel, renderKeyList, openKeys, groupBoxes, toggleMulti, clearMulti, updateSelBar, markDirty, renderTitle, resyncFromDoc, renderGroups, renderGroupDetail, refreshCaseList, openCase, mergeCase, caseSnapshot, marqueeSelect };
+window.__meridian = { S, COLORS, syncGraph, tick, draw, applyFilters, searchNodes, hitNode, hitGroup, centerOn, fit, w2s, s2w, selectNode, radiusFor, wake, kick, loop, truncLabel, renderKeyList, openKeys, groupBoxes, toggleMulti, clearMulti, updateSelBar, markDirty, renderTitle, resyncFromDoc, renderGroups, renderGroupDetail, refreshCaseList, openCase, mergeCase, caseSnapshot, marqueeSelect, renderSourceChecks };
 
 })();

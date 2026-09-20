@@ -72,3 +72,69 @@ export function fullRecon(row: ReconRow): any {
     created_at: row.created_at, updated_at: row.updated_at,
   };
 }
+
+// ---------- enrichment jobs ----------
+// Long-running company enrichments (scrape + registry fold-in) persist here
+// so the chat client (milton) can poll GET /api/enrich/:id. Jobs are
+// fire-and-forget from the requester's view: POST returns immediately and
+// the background runner updates status/progress/result.
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS enrich_jobs (
+  id TEXT PRIMARY KEY,
+  query TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'running',
+  progress_json TEXT NOT NULL DEFAULT '{}',
+  result_json TEXT,
+  nodes_json TEXT NOT NULL DEFAULT '[]',
+  edges_json TEXT NOT NULL DEFAULT '[]',
+  error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);`);
+
+export interface EnrichJobRow {
+  id: string; query: string; status: string; progress_json: string;
+  result_json: string | null; nodes_json: string; edges_json: string;
+  error: string | null; created_at: number; updated_at: number;
+}
+
+export function createEnrichJob(id: string, query: string): void {
+  db.query(
+    `INSERT INTO enrich_jobs (id, query, status, progress_json, created_at, updated_at)
+     VALUES (?, ?, 'running', '{}', ?, ?)`
+  ).run(id, query, now(), now());
+}
+
+export function getEnrichJob(id: string): EnrichJobRow | null {
+  return db.query(`SELECT * FROM enrich_jobs WHERE id = ?`).get(id) as EnrichJobRow | null;
+}
+
+export function listEnrichJobs(): any[] {
+  return db.query(
+    `SELECT id, query, status, created_at, updated_at FROM enrich_jobs
+     ORDER BY created_at DESC LIMIT 50`
+  ).all();
+}
+
+export function updateEnrichJob(id: string, patch: Record<string, any>): void {
+  const sets = Object.keys(patch).map((k) => `${k} = ?`).join(", ");
+  db.query(`UPDATE enrich_jobs SET ${sets}, updated_at = ? WHERE id = ?`)
+    .run(...Object.values(patch), now(), id);
+}
+
+export function fullEnrichJob(row: EnrichJobRow): any {
+  let result: any = null, progress: any = {};
+  try { if (row.result_json) result = JSON.parse(row.result_json); } catch { /* keep null */ }
+  try { progress = JSON.parse(row.progress_json || "{}"); } catch { /* keep {} */ }
+  return {
+    id: row.id, query: row.query, status: row.status, progress,
+    error: row.error,
+    company: result?.company ?? null,
+    principals: result?.principals ?? null,
+    notes: result?.notes ?? [],
+    nodes: JSON.parse(row.nodes_json || "[]"),
+    edges: JSON.parse(row.edges_json || "[]"),
+    created_at: row.created_at, updated_at: row.updated_at,
+  };
+}

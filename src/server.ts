@@ -4,7 +4,9 @@
 
 import {
   createRecon, getRecon, listRecons, updateRecon, deleteRecon, fullRecon,
+  createEnrichJob, getEnrichJob, listEnrichJobs, updateEnrichJob, fullEnrichJob,
 } from "./db";
+import { resolveDomain, enrichCompanySite } from "./enrich";
 import {
   initRouter, setRouterBase, requestRun, validateRunInput, listRuns, runDetail,
 } from "./router";
@@ -20,7 +22,7 @@ import {
   collectInternetdb, collectAdsblol, collectEonet, collectUsgs,
   collectHackertarget, collectMnemonic, collectCertspotter, collectBrasilapi,
   collectGleifName, collectSecEdgar, collectWikidataOrg,
-  collectHkcr, collectEnhetsregisteret,
+  collectHkcr, collectEnhetsregisteret, collectEnrich,
   probeKeySource,
   type Ctx, type GNode, type GEdge, type SourceResult,
 } from "./sources";
@@ -78,6 +80,7 @@ const COLLECTORS: Record<string, (ctx: Ctx) => Promise<SourceResult>> = {
   wikidataorg: collectWikidataOrg,
   hkcr: collectHkcr,
   enhetsregisteret: collectEnhetsregisteret,
+  enrich: collectEnrich,
 };
 
 // Interlink the graph: any two non-city nodes sharing a keyword get an edge.
@@ -149,6 +152,61 @@ async function runRecon(id: string, city: string, wanted: string[]) {
     updateRecon(id, { status: "failed" });
   } finally {
     running.delete(id);
+  }
+}
+
+async function runEnrichJob(id: string, query: string) {
+  const key = "enrich:" + id;
+  if (running.has(key)) return;
+  running.add(key);
+  const setProgress = (done: number, total: number, current: string) =>
+    updateEnrichJob(id, { progress_json: JSON.stringify({ done, total, current }) });
+  try {
+    setProgress(0, 4, "resolving domain");
+    const resolved = await resolveDomain(query);
+    if (!resolved) {
+      updateEnrichJob(id, {
+        status: "failed",
+        error: `couldn't resolve a company website for "${query}"`,
+      });
+      return;
+    }
+    const domain = resolved.domain;
+    const scraped = await enrichCompanySite(domain, {
+      progress: (_d, _t, c) =>
+        setProgress(1, 4, c ? `scraping ${c}` : "scraping company pages"),
+    });
+    setProgress(2, 4, "querying registries");
+    // fold in the keyless registries with a synthetic ctx: the "city" is the
+    // company itself, so name-match edges point at the company node and the
+    // conventional urlscan:domain:<slug> id lands on the scraped domain node.
+    const companyId =
+      scraped.nodes.find((n) => n.id.startsWith("enrich:company:"))?.id ||
+      `enrich:company:${domain}`;
+    const sub: Ctx = {
+      city: query, lat: 0, lon: 0, bbox: { s: 0, w: 0, n: 0, e: 0 },
+      country: "", countryCode: "", state: null, cityId: companyId,
+      facts: { domains: [domain] },
+    };
+    let nodes = scraped.nodes, edges = scraped.edges;
+    for (const fn of [collectGleifName, collectSecEdgar, collectWikidataOrg]) {
+      try {
+        const r = await fn(sub);
+        ({ nodes, edges } = mergeGraph({ nodes, edges }, r));
+      } catch { /* best-effort: one dead registry never fails the job */ }
+    }
+    setProgress(3, 4, "finalizing");
+    updateEnrichJob(id, {
+      status: "done",
+      progress_json: JSON.stringify({ done: 4, total: 4, current: "" }),
+      result_json: JSON.stringify(scraped.result),
+      nodes_json: JSON.stringify(nodes),
+      edges_json: JSON.stringify(edges),
+    });
+  } catch (e: any) {
+    updateEnrichJob(id, { status: "failed", error: String(e?.message || e).slice(0, 200) });
+  } finally {
+    running.delete(key);
   }
 }
 
@@ -326,6 +384,29 @@ const server = Bun.serve({
         const d = runDetail(runMatch[1], new URL(req.url).origin);
         if (!d) return json({ error: "not found" }, 404);
         return json({ run: d });
+      }
+
+      // ---------- enrichment jobs ----------
+      // Long-running company enrichment (own-site scrape + registry fold-in).
+      // POST returns immediately with a job id; the job runs in the
+      // background and the client polls GET /api/enrich/:id. Scraping is
+      // explicitly allowed to take longer than a few seconds (capped at 60s).
+      if (path === "/api/enrich" && method === "POST") {
+        const b = await readBody(req);
+        const query = String(b.query || "").trim().slice(0, 200);
+        if (!query) return json({ error: "query is required" }, 400);
+        const id = "e" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+        createEnrichJob(id, query);
+        runEnrichJob(id, query); // background — never awaited
+        return json({ job_id: id, status: "running" }, 201);
+      }
+      if (path === "/api/enrich" && method === "GET")
+        return json({ jobs: listEnrichJobs() });
+      const enrichMatch = path.match(/^\/api\/enrich\/([A-Za-z0-9_-]+)$/);
+      if (enrichMatch && method === "GET") {
+        const job = getEnrichJob(enrichMatch[1]);
+        if (!job) return json({ error: "not found" }, 404);
+        return json(fullEnrichJob(job));
       }
 
       // ---------- recons ----------
