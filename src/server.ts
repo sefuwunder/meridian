@@ -5,8 +5,10 @@
 import {
   createRecon, getRecon, listRecons, updateRecon, deleteRecon, fullRecon,
   createEnrichJob, getEnrichJob, listEnrichJobs, updateEnrichJob, fullEnrichJob,
+  createProspectJob, getProspectJob, listProspectJobs, updateProspectJob, fullProspectJob,
 } from "./db";
 import { resolveDomain, enrichCompanySite } from "./enrich";
+import { runProspect } from "./prospect";
 import {
   initRouter, setRouterBase, requestRun, validateRunInput, listRuns, runDetail,
 } from "./router";
@@ -210,6 +212,44 @@ async function runEnrichJob(id: string, query: string) {
   }
 }
 
+export async function runProspectJob(id: string, location: string, industry: string) {
+  const key = "prospect:" + id;
+  if (running.has(key)) return;
+  running.add(key);
+  const setProgress = (done: number, total: number, current: string) =>
+    updateProspectJob(id, { progress_json: JSON.stringify({ done, total, current }) });
+  try {
+    setProgress(0, 3, "geocoding");
+    const { companies, nodes, edges } = await runProspect(location, industry, {
+      progress: (d, t, c) => setProgress(d, t, c),
+      // the territory node (and later the companies) stream into the store
+      // as they arrive, so a job that dies downstream still shows something
+      onPartial: (n, e) => updateProspectJob(id, {
+        nodes_json: JSON.stringify(n), edges_json: JSON.stringify(e),
+      }),
+    });
+    updateProspectJob(id, {
+      status: "done",
+      progress_json: JSON.stringify({ done: 3, total: 3, current: "" }),
+      result_json: JSON.stringify({ companies }),
+      nodes_json: JSON.stringify(nodes),
+      edges_json: JSON.stringify(edges),
+    });
+  } catch (e: any) {
+    const msg = String(e?.message || e).slice(0, 200);
+    if (/location not found/i.test(msg)) {
+      // nothing to fall back to without a territory: a clean failure
+      updateProspectJob(id, { status: "failed", error: msg });
+    } else {
+      // one dead downstream step never kills the whole job: keep whatever
+      // was persisted (at least the territory node) and land in partial
+      updateProspectJob(id, { status: "partial", error: msg });
+    }
+  } finally {
+    running.delete(key);
+  }
+}
+
 const server = Bun.serve({
   port: PORT,
   async fetch(req) {
@@ -407,6 +447,31 @@ const server = Bun.serve({
         const job = getEnrichJob(enrichMatch[1]);
         if (!job) return json({ error: "not found" }, 404);
         return json(fullEnrichJob(job));
+      }
+
+      // ---------- territory prospecting jobs ----------
+      // Find companies by location + industry (a salesperson building a book
+      // of business). POST returns immediately with a job id; the job runs
+      // in the background and the client polls GET /api/prospect/:id. The
+      // industry→OSM-tag match is deterministic; only the Nominatim geocode
+      // and the one Overpass query touch the network, both timeout-guarded.
+      if (path === "/api/prospect" && method === "POST") {
+        const b = await readBody(req);
+        const loc = String(b.location ?? ""), ind = String(b.industry ?? "");
+        if (!loc.trim() || !ind.trim() || loc.length > 200 || ind.length > 200)
+          return json({ error: "location and industry are required (max 200 chars each)" }, 400);
+        const id = "p" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
+        createProspectJob(id, loc.trim(), ind.trim());
+        runProspectJob(id, loc.trim(), ind.trim()); // background — never awaited
+        return json({ job_id: id, status: "running" }, 201);
+      }
+      if (path === "/api/prospect" && method === "GET")
+        return json({ jobs: listProspectJobs() });
+      const prospectMatch = path.match(/^\/api\/prospect\/([A-Za-z0-9_-]+)$/);
+      if (prospectMatch && method === "GET") {
+        const job = getProspectJob(prospectMatch[1]);
+        if (!job) return json({ error: "not found" }, 404);
+        return json(fullProspectJob(job));
       }
 
       // ---------- recons ----------

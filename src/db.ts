@@ -123,6 +123,73 @@ export function updateEnrichJob(id: string, patch: Record<string, any>): void {
     .run(...Object.values(patch), now(), id);
 }
 
+// ---------- prospecting jobs ----------
+// Territory-prospecting jobs: find companies by location + industry
+// (a salesperson building a book of business). Same fire-and-forget shape
+// as enrich_jobs: POST returns immediately, the background runner updates
+// status/progress/result, and milton polls GET /api/prospect/:id.
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS prospect_jobs (
+  id TEXT PRIMARY KEY,
+  location TEXT NOT NULL,
+  industry TEXT NOT NULL,
+  status TEXT NOT NULL DEFAULT 'running',
+  progress_json TEXT NOT NULL DEFAULT '{}',
+  result_json TEXT,
+  nodes_json TEXT NOT NULL DEFAULT '[]',
+  edges_json TEXT NOT NULL DEFAULT '[]',
+  error TEXT,
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);`);
+
+export interface ProspectJobRow {
+  id: string; location: string; industry: string; status: string;
+  progress_json: string; result_json: string | null;
+  nodes_json: string; edges_json: string;
+  error: string | null; created_at: number; updated_at: number;
+}
+
+export function createProspectJob(id: string, location: string, industry: string): void {
+  db.query(
+    `INSERT INTO prospect_jobs (id, location, industry, status, progress_json, created_at, updated_at)
+     VALUES (?, ?, ?, 'running', '{}', ?, ?)`
+  ).run(id, location, industry, now(), now());
+}
+
+export function getProspectJob(id: string): ProspectJobRow | null {
+  return db.query(`SELECT * FROM prospect_jobs WHERE id = ?`).get(id) as ProspectJobRow | null;
+}
+
+export function listProspectJobs(): any[] {
+  return db.query(
+    `SELECT id, location, industry, status, created_at, updated_at,
+            COALESCE(json_array_length(result_json, '$.companies'), 0) AS company_count
+     FROM prospect_jobs ORDER BY created_at DESC LIMIT 50`
+  ).all();
+}
+
+export function updateProspectJob(id: string, patch: Record<string, any>): void {
+  const sets = Object.keys(patch).map((k) => `${k} = ?`).join(", ");
+  db.query(`UPDATE prospect_jobs SET ${sets}, updated_at = ? WHERE id = ?`)
+    .run(...Object.values(patch), now(), id);
+}
+
+export function fullProspectJob(row: ProspectJobRow): any {
+  let result: any = null, progress: any = {};
+  try { if (row.result_json) result = JSON.parse(row.result_json); } catch { /* keep null */ }
+  try { progress = JSON.parse(row.progress_json || "{}"); } catch { /* keep {} */ }
+  return {
+    id: row.id, location: row.location, industry: row.industry,
+    status: row.status, progress,
+    error: row.error,
+    companies: result?.companies ?? [],
+    nodes: JSON.parse(row.nodes_json || "[]"),
+    edges: JSON.parse(row.edges_json || "[]"),
+    created_at: row.created_at, updated_at: row.updated_at,
+  };
+}
 export function fullEnrichJob(row: EnrichJobRow): any {
   let result: any = null, progress: any = {};
   try { if (row.result_json) result = JSON.parse(row.result_json); } catch { /* keep null */ }

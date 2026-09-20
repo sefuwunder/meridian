@@ -710,7 +710,8 @@ function selectNode(id) {
       dsBtn.textContent = dsLabel;
     }
   };
-  el.appendChild(dsBtn);
+  // deep search is wired to recon documents; prospect views are read-only snapshots
+  if (!(S.recon && String(S.recon.id).startsWith("prospect:"))) el.appendChild(dsBtn);
   if (nb.length) {
     const t = document.createElement("div"); t.className = "kv"; t.style.marginTop = "10px";
     t.innerHTML = `<b>${nb.length}</b> connection${nb.length === 1 ? "" : "s"}`;
@@ -925,7 +926,117 @@ async function loadRecon(id, poll) {
   } catch { /* ignore */ }
 }
 
-// ---------------- groups ----------------
+// ---------------- territory prospecting ----------------
+// Find companies by place + industry (a salesperson building a book of
+// business). Jobs are fire-and-forget like recons: POST starts one, the
+// list polls while any job is running, and clicking a finished job loads
+// its nodes/edges into the canvas as a synthetic read-only document.
+
+const PROSPECT_PILL = { running: "collecting", done: "ready", partial: "partial", failed: "failed" };
+let prospectPollTimer = null;
+
+async function loadProspectList() {
+  try {
+    const { jobs } = await api("/api/prospect");
+    const box = $("prospectList");
+    box.innerHTML = "";
+    for (const j of jobs) {
+      const li = document.createElement("li");
+      if (S.recon && S.recon.id === "prospect:" + j.id) li.className = "active";
+      let meta;
+      if (j.status === "running") {
+        meta = "starting…";
+        try {
+          const full = await api("/api/prospect/" + encodeURIComponent(j.id));
+          const p = full.progress || {};
+          if (p.total) meta = `${p.done}/${p.total} · ${p.current || ""}`;
+        } catch { meta = "running…"; }
+      } else if (j.status === "done") {
+        meta = `${j.company_count} companies · click to open in graph`;
+      } else if (j.status === "partial") {
+        meta = `partial · ${j.company_count} companies · click to open in graph`;
+      } else {
+        meta = "failed — click for the error";
+      }
+      li.innerHTML = `<div class="t"><span></span><span class="pill ${PROSPECT_PILL[j.status] || ""}">${j.status}</span></div>
+        <div class="m"></div>`;
+      li.querySelector(".t span").textContent = `${j.industry} · ${j.location}`;
+      li.querySelector(".m").textContent = meta;
+      li.onclick = () => openProspectJob(j.id);
+      box.appendChild(li);
+    }
+  } catch { /* offline */ }
+}
+
+function scheduleProspectPoll() {
+  if (prospectPollTimer) clearTimeout(prospectPollTimer);
+  prospectPollTimer = setTimeout(async () => {
+    prospectPollTimer = null;
+    try {
+      const { jobs } = await api("/api/prospect");
+      await loadProspectList();
+      if (jobs.some((j) => j.status === "running")) scheduleProspectPoll();
+    } catch { /* next user action re-polls */ }
+  }, 2500);
+}
+
+async function openProspectJob(id) {
+  try {
+    const job = await api("/api/prospect/" + encodeURIComponent(id));
+    if (!job.nodes || !job.nodes.length) {
+      const why = job.error ? `: ${job.error}` : job.status === "running" ? " — still running" : "";
+      alert("nothing to show yet" + why);
+      return;
+    }
+    stopPoll();
+    if (prospectPollTimer) { clearTimeout(prospectPollTimer); prospectPollTimer = null; }
+    S.recon = {
+      id: "prospect:" + job.id,
+      city: `prospects · ${job.industry} in ${job.location}`,
+      country: null, country_code: null, lat: null, lon: null,
+      cityId: "", facts: {}, sources: [], status: job.status, created_at: job.created_at,
+      nodes: job.nodes, edges: job.edges,
+    };
+    S.sim.clear(); S.edges = []; S.selected = null;
+    S.view = { x: 0, y: 0, k: 1 };
+    S.typeFilter = new Set(ALL_TYPES);
+    S.groups = []; S.multi.clear();
+    S.docKind = "recon"; S.caseId = null; S.caseName = ""; S.dirty = false;
+    renderGroups(); updateSelBar(); selectNode(null);
+    syncGraph();
+    renderTitle();
+    renderDossier({}, null);
+    $("collectPanel").hidden = true;
+    startClock(job.created_at);
+    loadProspectList();
+    setTimeout(fit, 400);
+  } catch (e) {
+    alert("open failed: " + e.message);
+  }
+}
+
+$("btnProspectStart").onclick = async () => {
+  const location = $("prospectLocation").value.trim();
+  const industry = $("prospectIndustry").value.trim();
+  if (!location) { $("prospectLocation").focus(); return; }
+  if (!industry) { $("prospectIndustry").focus(); return; }
+  const btn = $("btnProspectStart");
+  btn.disabled = true; btn.textContent = "starting…";
+  try {
+    await api("/api/prospect", {
+      method: "POST", body: JSON.stringify({ location, industry }),
+    });
+    $("prospectLocation").value = ""; $("prospectIndustry").value = "";
+    await loadProspectList();
+    scheduleProspectPoll();
+  } catch (e) {
+    alert("prospect failed: " + e.message);
+  } finally {
+    btn.disabled = false; btn.textContent = "find companies";
+  }
+};
+$("prospectIndustry").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btnProspectStart").click(); });
+$("prospectLocation").addEventListener("keydown", (e) => { if (e.key === "Enter") $("btnProspectStart").click(); });
 
 function renderGroupDetail(gid) {
   const g = S.groups.find((x) => x.id === gid);
@@ -1205,7 +1316,8 @@ $("btnPause").onclick = (e) => {
   kick();
 };
 $("btnExport").onclick = () => {
-  if (S.recon) window.location.href = `/api/recon/${S.recon.id}/export`;
+  if (!S.recon || S.recon.id.startsWith("prospect:")) { alert("open a recon to export"); return; }
+  window.location.href = `/api/recon/${S.recon.id}/export`;
 };
 $("btnCsv").onclick = () => {
   if (!S.recon) return;
@@ -1222,7 +1334,7 @@ $("btnCsv").onclick = () => {
 
 // note modal
 $("btnNote").onclick = () => {
-  if (!S.recon) { alert("launch a recon first"); return; }
+  if (!S.recon || S.recon.id.startsWith("prospect:")) { alert("open a recon to take notes"); return; }
   $("noteLabel").value = ""; $("noteBody").value = "";
   $("noteModal").hidden = false;
   $("noteLabel").focus();
@@ -1404,6 +1516,7 @@ function boot() {
   resize();
   renderSourceChecks();
   renderChips();
+  loadProspectList();
   loadList().then(() => {
     // auto-open the latest recon if any
     return api("/api/recon").then(({ recons }) => {
@@ -1417,6 +1530,6 @@ if (document.readyState === "loading") document.addEventListener("DOMContentLoad
 else boot();
 
 // test seam
-window.__meridian = { S, COLORS, syncGraph, tick, draw, applyFilters, searchNodes, hitNode, hitGroup, centerOn, fit, w2s, s2w, selectNode, radiusFor, wake, kick, loop, truncLabel, renderKeyList, openKeys, groupBoxes, toggleMulti, clearMulti, updateSelBar, markDirty, renderTitle, resyncFromDoc, renderGroups, renderGroupDetail, refreshCaseList, openCase, mergeCase, caseSnapshot, marqueeSelect, renderSourceChecks };
+window.__meridian = { S, COLORS, syncGraph, tick, draw, applyFilters, searchNodes, hitNode, hitGroup, centerOn, fit, w2s, s2w, selectNode, radiusFor, wake, kick, loop, truncLabel, renderKeyList, openKeys, groupBoxes, toggleMulti, clearMulti, updateSelBar, markDirty, renderTitle, resyncFromDoc, renderGroups, renderGroupDetail, refreshCaseList, openCase, mergeCase, caseSnapshot, marqueeSelect, renderSourceChecks, loadProspectList, openProspectJob };
 
 })();
