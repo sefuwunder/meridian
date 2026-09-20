@@ -20,6 +20,7 @@ import {
   collectInternetdb, collectAdsblol, collectEonet, collectUsgs,
   collectHackertarget, collectMnemonic, collectCertspotter, collectBrasilapi,
   collectGleifName, collectSecEdgar, collectWikidataOrg,
+  collectHkcr, collectEnhetsregisteret,
   probeKeySource,
   type Ctx, type GNode, type GEdge, type SourceResult,
 } from "./sources";
@@ -75,6 +76,8 @@ const COLLECTORS: Record<string, (ctx: Ctx) => Promise<SourceResult>> = {
   gleifname: collectGleifName,
   secedgar: collectSecEdgar,
   wikidataorg: collectWikidataOrg,
+  hkcr: collectHkcr,
+  enhetsregisteret: collectEnhetsregisteret,
 };
 
 // Interlink the graph: any two non-city nodes sharing a keyword get an edge.
@@ -158,6 +161,9 @@ const server = Bun.serve({
     try {
       // ---------- api keys ----------
       if (path === "/api/keys" && method === "GET") return json({ keys: keyStatuses() });
+      // ---------- source defs (drives the launch-form checkboxes; never hardcode) ----------
+      if (path === "/api/source-defs" && method === "GET")
+        return json({ sources: SOURCE_DEFS.map((d) => ({ key: d.key, label: d.label })) });
       if (path === "/api/keys" && method === "POST") {
         const b = await readBody(req);
         const id = String(b.key || "");

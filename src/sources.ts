@@ -1795,12 +1795,24 @@ export async function collectBrasilapi(ctx: Ctx): Promise<SourceResult> {
 // matched (urlscan:domain:<slug> ids are reused by convention).
 export interface CompanyKeyword { kw: string; domain: string }
 
+// Company part of a domain, aware of ccTLD second-level suffixes:
+// hsbc.com.hk -> hsbc (not "com"), example.co.uk -> example.
+const SECOND_LEVEL = new Set(["com", "co", "org", "net", "gov", "edu", "ac"]);
+
+export function domainLabel(d: string): string {
+  const parts = String(d || "").toLowerCase().split(".").filter(Boolean);
+  if (parts.length >= 3 && parts[parts.length - 1].length === 2 &&
+      SECOND_LEVEL.has(parts[parts.length - 2]))
+    return parts[parts.length - 3];
+  return parts.slice(-2)[0] || "";
+}
+
 export function companyKeywordPairs(ctx: Ctx, cap = 3): CompanyKeyword[] {
   const domains: string[] = Array.isArray(ctx.facts?.domains) ? ctx.facts.domains : [];
   const out: CompanyKeyword[] = [];
   const seen = new Set<string>();
   for (const d of domains) {
-    const label = String(d || "").toLowerCase().split(".").slice(-2)[0] || "";
+    const label = domainLabel(d);
     for (const kw of extractKeywords(label)) {
       if (kw.length < 4 || seen.has(kw)) continue;
       seen.add(kw);
@@ -2013,6 +2025,162 @@ export async function collectWikidataOrg(ctx: Ctx): Promise<SourceResult> {
   };
 }
 
+// ---------- 37. Hong Kong companies (Companies Registry open data) ----------
+// data.cr.gov.hk open-data API, keyless, refreshed daily. Covers live local
+// companies: English + Chinese name, BRN, registered office address, company
+// type, incorporation date. No officers, filings, or dissolved entities —
+// those live behind the paid ICRIS Cyber Search. Name search is prefix-only
+// (Comp_name / begins_with; an address operator returns 400 "Invalid
+// requested Item.", so no district-scoped query is possible). Like the
+// GLEIF name collector this is keyword-driven: company-name keywords from
+// the recon's stashed domains (urlscan etc.) become search prefixes.
+// Cap: 3 keywords x 1 request, 10 results each. Idles when no domains were
+// stashed. Response: [ { Brn, Chinese_Company_Name, English_Company_Name,
+// Address_of_Registered_Office, Company_Type, Date_of_Incorporation,
+// Re-domiciliation_Date } ].
+export interface HkCompany { brn: string; name: string; detail: string }
+
+export function parseHkCompany(row: any): HkCompany | null {
+  if (!row || typeof row !== "object") return null;
+  const brn = String(row.Brn || "").trim().toUpperCase();
+  if (!/^[A-Z0-9]{1,12}$/.test(brn)) return null;
+  const name = String(row.English_Company_Name || row.Chinese_Company_Name || "").trim();
+  if (!name) return null;
+  const inc = String(row.Date_of_Incorporation || "").trim();
+  const detail = [
+    `BRN ${brn}`,
+    String(row.Company_Type || "").trim(),
+    String(row.Address_of_Registered_Office || "").trim().slice(0, 140),
+    inc ? `inc. ${inc}` : "",
+  ].filter(Boolean).join(" · ");
+  return { brn, name: name.slice(0, 90), detail: detail.slice(0, 240) };
+}
+
+function hkSearchUrl(prefix: string): string {
+  const q = `query[0][key1]=Comp_name&query[0][key2]=begins_with` +
+    `&query[0][key3]=${encodeURIComponent(prefix)}&format=json`;
+  return `https://data.cr.gov.hk/cr/api/api/v1/api_builder/json/local/search?${q}`;
+}
+
+export async function collectHkcr(ctx: Ctx): Promise<SourceResult> {
+  const pairs = companyKeywordPairs(ctx, 3);
+  if (!pairs.length)
+    return { nodes: [], edges: [], note: "no company keywords — no domains stashed this run" };
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  for (const { kw, domain } of pairs) {
+    let j: any;
+    try {
+      j = await fetchJson(hkSearchUrl(kw.toUpperCase()), {}, 25000);
+    } catch (e) { throwIfRateLimited(e, "hkcr"); continue; }
+    const rows = Array.isArray(j) ? j : [];
+    for (const row of rows.slice(0, 10)) {
+      const p = parseHkCompany(row);
+      if (!p || seen.has(p.brn)) continue;
+      seen.add(p.brn);
+      const id = `hkcr:${p.brn.toLowerCase()}`;
+      nodes.push({
+        id, label: p.name, type: "org" as NodeType, subtype: "company",
+        source: "hkcr", detail: p.detail,
+      });
+      edges.push({ from: id, to: ctx.cityId, label: "registered in" });
+      edges.push({ from: id, to: `urlscan:domain:${slug(domain)}`, label: "name matches domain" });
+    }
+  }
+  return {
+    nodes, edges,
+    note: `${nodes.length} HK companies matching ${pairs.map((p) => p.kw).join(", ")}`,
+  };
+}
+
+// ---------- 38. Norwegian entities (Enhetsregisteret) ----------
+// data.brreg.no open JSON API, keyless, NLOD 2.0. Native municipality
+// scoping via kommunenummer: a built-in table maps the recon city to a
+// 4-digit kommunenummer (post-2020 reform). Non-Norwegian cities and cities
+// outside the table idle with a clear note — no fuzzy municipality
+// guessing. One request per recon (size=40, ≤25 nodes). Response:
+// { _embedded: { enheter: [ { organisasjonsnummer, navn,
+// organisasjonsform: { beskrivelse }, forretningsadresse:
+// { adresse[], postnummer, poststed, kommune }, aktivitet[],
+// konkurs, underAvvikling, ... } ] } }.
+const KOMMUNER: Record<string, string> = {
+  oslo: "0301", bergen: "4601", trondheim: "5001", stavanger: "1103",
+  tromso: "5401", drammen: "3005", fredrikstad: "3004", kristiansand: "4204",
+  sandnes: "1108", alesund: "1507", bodo: "1804", moss: "3002",
+  haugesund: "1106", arendal: "4203", hamar: "3403", halden: "3001",
+  larvik: "3909", tonsberg: "3905", sandefjord: "3907", sarpsborg: "3003",
+  skien: "3808", porsgrunn: "3806", molde: "1506", harstad: "5403",
+  gjovik: "3402", kongsberg: "3006", asker: "3025", sandvika: "3024",
+  lillestrom: "3030", jessheim: "3033",
+};
+
+export function kommunenummerFor(city: string): string | null {
+  // slug() drops "ø" entirely, so normalize Scandinavian letters first.
+  const norm = city.toLowerCase()
+    .replace(/æ/g, "ae").replace(/ø/g, "o").replace(/å/g, "a");
+  return KOMMUNER[slug(norm)] || null;
+}
+
+export interface BrregEnhet { orgnr: string; name: string; detail: string; url: string }
+
+export function parseBrregEnhet(e: any): BrregEnhet | null {
+  if (!e || typeof e !== "object") return null;
+  const orgnr = String(e.organisasjonsnummer || "").replace(/\D/g, "");
+  if (!/^\d{9}$/.test(orgnr)) return null;
+  // Some names carry leading dash runs from the registry ("----FOO AS").
+  const name = String(e.navn || "").replace(/^[^A-Za-z0-9À-ɏ]+/u, "").trim();
+  if (!name) return null;
+  const fa = e.forretningsadresse || {};
+  const addrParts = Array.isArray(fa.adresse) ? fa.adresse.map(String) : [];
+  const post = [fa.postnummer, fa.poststed].filter(Boolean).join(" ");
+  if (post) addrParts.push(String(post));
+  const addr = addrParts.join(", ").slice(0, 120);
+  const flags = [
+    e.konkurs ? "konkurs" : "",
+    e.underAvvikling ? "under avvikling" : "",
+  ].filter(Boolean);
+  const aktivitet = (Array.isArray(e.aktivitet) ? e.aktivitet : [])
+    .map(String).join("; ").slice(0, 80);
+  const detail = [
+    `org.nr ${orgnr.replace(/(\d{3})(\d{3})(\d{3})/, "$1 $2 $3")}`,
+    String(e.organisasjonsform?.beskrivelse || "").trim(),
+    addr, aktivitet, ...flags,
+  ].filter(Boolean).join(" · ");
+  return {
+    orgnr, name: name.slice(0, 90), detail: detail.slice(0, 240),
+    url: `https://data.brreg.no/enhetsregisteret/api/enheter/${orgnr}`,
+  };
+}
+
+export async function collectEnhetsregisteret(ctx: Ctx): Promise<SourceResult> {
+  if (ctx.countryCode !== "NO")
+    return { nodes: [], edges: [], note: "Norway-only source — idle for non-Norwegian recon" };
+  const knr = kommunenummerFor(ctx.city);
+  if (!knr)
+    return { nodes: [], edges: [], note: `no kommunenummer mapping for "${ctx.city}" — table covers the largest kommuner only` };
+  let j: any;
+  try {
+    j = await fetchJson(
+      `https://data.brreg.no/enhetsregisteret/api/enheter?kommunenummer=${knr}&size=40`,
+      {}, 25000);
+  } catch (e) { throwIfRateLimited(e, "enhetsregisteret"); }
+  const rows = Array.isArray(j?._embedded?.enheter) ? j._embedded.enheter : [];
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  for (const row of rows.slice(0, 25)) {
+    const p = parseBrregEnhet(row);
+    if (!p || seen.has(p.orgnr)) continue;
+    seen.add(p.orgnr);
+    const id = `brreg:${p.orgnr}`;
+    nodes.push({
+      id, label: p.name, type: "org" as NodeType, subtype: "company",
+      source: "enhetsregisteret", detail: p.detail, url: p.url,
+    });
+    edges.push({ from: id, to: ctx.cityId, label: "registered in" });
+  }
+  return { nodes, edges, note: `${nodes.length} entities in kommune ${knr}` };
+}
+
 export const SOURCE_DEFS = [
   { key: "geocode", label: "Geocode · OpenStreetMap" },
   { key: "overpass", label: "Places · OpenStreetMap" },
@@ -2050,6 +2218,8 @@ export const SOURCE_DEFS = [
   { key: "gleifname", label: "Entity search · GLEIF" },
   { key: "secedgar", label: "Filers · SEC EDGAR" },
   { key: "wikidataorg", label: "Organizations · Wikidata" },
+  { key: "hkcr", label: "HK companies · Companies Registry" },
+  { key: "enhetsregisteret", label: "Norwegian entities · Enhetsregisteret" },
 ];
 
 // ---------- keyword interlinking ----------

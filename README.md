@@ -3,7 +3,7 @@
 Land in a foreign city, launch a recon sprint, and watch social, cultural, and
 business intel assemble itself into an interactive web of connected nodes.
 
-`meridian` collects from **thirty-three free, keyless sources** plus three optional
+`meridian` collects from **thirty-eight free, keyless sources** plus three optional
 keyed-free ones (OCCRP Aleph and WiGLE need free API credentials to activate;
 OpenFEC works out of the box on a low demo quota and accepts a free personal
 key for the full rate). It lays the results out as a force-directed node graph: the city
@@ -75,6 +75,8 @@ the header tracks elapsed time.
 | 34 | GLEIF name search | keyless: GLEIF `filter[entity.legalName]` for company-name keywords derived from the recon's stashed domains → org nodes (legal name, LEI, status, address) linked to the city hub and back to the matching domain node. 3 keywords × 1 request. Idles when no domains were stashed. |
 | 35 | SEC EDGAR | keyless (descriptive User-Agent, well under SEC rate guidance): EFTS full-text search-index for the company keyword → filer CIKs → `data.sec.gov` submissions JSON → org nodes (legal name, CIK, ticker, SIC, business address). 2 keywords × (1 + up to 3) requests. Idles when no domains were stashed. |
 | 36 | Wikidata org search | keyless: `wbsearchentities` for the company keyword, then one batched `wbgetentities` call; only items whose direct P31 is a known org class (company, business, public company, enterprise, corporation, technology company) become org nodes. No SPARQL — the transitive path query 502s/times out on the public endpoint. 3 keywords × 2 requests. Idles when no domains were stashed. |
+| 37 | HK Companies Registry | keyless (data.cr.gov.hk, refreshed daily): prefix-only company-name search for keywords derived from the recon's stashed domains → org nodes (BRN, registered office address, company type, incorporation date) linked to the city hub and back to the matching domain node. Live local companies only — no officers, filings, or dissolved entities. 3 keywords × 1 request. Idles when no domains were stashed. |
+| 38 | Enhetsregisteret | keyless (data.brreg.no, NLOD 2.0): entities registered in the recon city via native municipality scoping — the city maps to a 4-digit kommunenummer through a built-in table of the largest kommuner. One request per recon (≤25 org nodes with org.nr, legal form, business address, activity, konkurs/avvikling flags). Norway-only; idles elsewhere and for cities outside the table. |
 
 Every source is best-effort and independent: one dead API marks its row failed
 in the collection panel and the sprint continues. Nothing is ever half-merged —

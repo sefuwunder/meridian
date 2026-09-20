@@ -1345,10 +1345,19 @@ async function openKeys() {
 $("btnKeys").onclick = openKeys;
 $("keysClose").onclick = () => { $("keysModal").hidden = true; };
 
-// new recon form
-function renderSourceChecks() {
+// new recon form — checkboxes are generated from /api/source-defs (the
+// server's SOURCE_DEFS), so new collectors appear automatically. The static
+// list below is a fallback for when the server can't be reached.
+async function renderSourceChecks() {
   const box = $("sourceChecks");
-  const defs = [
+  let defs = null;
+  try {
+    const r = await api("/api/source-defs");
+    if (Array.isArray(r.sources) && r.sources.length) defs = r.sources;
+  } catch { /* fall through to the static list */ }
+  const items = defs
+    ? defs.map((d) => [d.key, d.label.replace(/^.* · /, "")])
+    : [
     ["geocode", "geocode"], ["overpass", "places"], ["wikipedia", "profile"],
     ["business", "companies"], ["people", "people"], ["music", "music"],
     ["news", "news"], ["country", "country"], ["moneytime", "money+time"], ["weather", "weather"],
@@ -1361,8 +1370,9 @@ function renderSourceChecks() {
     ["usgs", "earthquakes"], ["hackertarget", "infra recon"], ["mnemonic", "passive DNS"],
     ["certspotter", "cert transparency"], ["brasilapi", "brazil data"],
     ["gleifname", "entity search"], ["secedgar", "SEC filers"], ["wikidataorg", "organizations"],
+    ["hkcr", "HK companies"], ["enhetsregisteret", "norwegian entities"],
   ];
-  for (const [key, label] of defs) {
+  for (const [key, label] of items) {
     const l = document.createElement("label");
     l.innerHTML = `<input type="checkbox" checked ${key === "geocode" ? "disabled" : ""} value="${key}"><span></span>`;
     l.querySelector("span").textContent = label;
