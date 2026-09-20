@@ -197,6 +197,15 @@ test("extractPrincipals handles leadership pages", () => {
   expect(ps.find((p) => p.name === "Edsger Dijkstra")!.title).toMatch(/Managing Director/i);
 });
 
+test("extractPrincipals rejects off-domain and social source URLs", () => {
+  expect(extractPrincipals(HOME_HTML, "https://linkedin.com/company/acme", DOMAIN)).toEqual([]);
+  expect(extractPrincipals(HOME_HTML, "https://twitter.com/acme", DOMAIN)).toEqual([]);
+  expect(extractPrincipals(HOME_HTML, "https://evil.com/team", DOMAIN)).toEqual([]);
+  expect(extractPrincipals(HOME_HTML, "", DOMAIN)).toEqual([]);
+  // on-domain still works
+  expect(extractPrincipals(HOME_HTML, `https://${DOMAIN}/`, DOMAIN).length).toBeGreaterThan(0);
+});
+
 // ---------- full scrape ----------
 
 test("enrichCompanySite builds profile, principals, and graph", async () => {
@@ -314,4 +323,122 @@ test("launch form renders an enrich checkbox from /api/source-defs", async () =>
     g.document = prevDoc; g.window = prevWin; g.fetch = prevFetch;
     delete g.__meridian;
   }
+});
+
+// ---------- /api/enrich job lifecycle (live server, canned network) ----------
+// Boots the real server on a scratch port with the network stubbed: the full
+// POST -> running -> done and POST -> running -> failed paths run end to end.
+
+const API_PORT = 45691;
+const API_BASE = `http://localhost:${API_PORT}`;
+const UNRESOLVABLE = "Unresolvable Company Xyzzy";
+
+/** Canned web for the lifecycle tests; passes the API server itself through. */
+function lifecycleStub(url: string, init?: RequestInit): Promise<Response> {
+  const u = String(url);
+  if (u.includes(`localhost:${API_PORT}`) || u.includes(`127.0.0.1:${API_PORT}`))
+    return realFetch(url, init);
+  if (u.includes("html.duckduckgo.com")) {
+    if (u.includes(encodeURIComponent(UNRESOLVABLE)))
+      return Promise.resolve(htmlResponse("<html><body>no results</body></html>"));
+    return Promise.resolve(htmlResponse(DDG_HTML));
+  }
+  if (u === `https://${DOMAIN}/robots.txt`) return Promise.resolve(htmlResponse(ROBOTS));
+  if (u === `https://${DOMAIN}/`) return Promise.resolve(htmlResponse(HOME_HTML));
+  if (u === `https://${DOMAIN}/team`) return Promise.resolve(htmlResponse(TEAM_HTML));
+  if (u.includes("api.gleif.org")) return Promise.resolve(jsonResponse(GLEIF_JSON));
+  if (u.includes("efts.sec.gov") || u.includes("data.sec.gov")) return Promise.resolve(jsonResponse(EMPTY_EFTS));
+  if (u.includes("wikidata.org/w/api.php")) return Promise.resolve(jsonResponse(EMPTY_WD));
+  return Promise.resolve(new Response("not found", { status: 404 }));
+}
+
+let apiBooted = false;
+async function bootApi() {
+  globalThis.fetch = lifecycleStub as any;
+  if (!apiBooted) {
+    apiBooted = true;
+    process.env.PORT = String(API_PORT);
+    await import("./server");
+  }
+}
+
+async function pollEnrichJob(id: string, terminal: string[]): Promise<any> {
+  const deadline = Date.now() + 25000;
+  for (;;) {
+    const r = await fetch(`${API_BASE}/api/enrich/${id}`);
+    const j: any = await r.json();
+    if (terminal.includes(j.status)) return j;
+    if (Date.now() > deadline) throw new Error(`enrich job ${id} stuck in "${j.status}"`);
+    await new Promise((r2) => setTimeout(r2, 100));
+  }
+}
+
+const lifecycleJobIds: string[] = [];
+
+test("POST /api/enrich runs running -> done with company, principals, graph", async () => {
+  await bootApi();
+  const post = await fetch(`${API_BASE}/api/enrich`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: "Acme Widgets" }),
+  });
+  expect(post.status).toBe(201);
+  const created: any = await post.json();
+  expect(created.status).toBe("running");
+  expect(typeof created.job_id).toBe("string");
+  lifecycleJobIds.push(created.job_id);
+
+  const mid: any = await (await fetch(`${API_BASE}/api/enrich/${created.job_id}`)).json();
+  expect(["running", "done"]).toContain(mid.status);
+
+  const done = await pollEnrichJob(created.job_id, ["done", "failed"]);
+  expect(done.status).toBe("done");
+  expect(done.progress.done).toBe(4);
+  expect(done.company.name).toBe("Acme Widgets Inc.");
+  const names = (done.principals || []).map((p: any) => p.name);
+  expect(names).toContain("Ada Lovelace");
+  expect(names).toContain("Alan Turing");
+  const ids = (done.nodes || []).map((n: any) => n.id);
+  expect(ids).toContain("enrich:company:acme-example-com");
+  expect(ids).toContain("gleif:549300abcdef12345678"); // registry folded in
+  expect(done.edges.length).toBeGreaterThan(0);
+
+  const list: any = await (await fetch(`${API_BASE}/api/enrich`)).json();
+  expect(list.jobs.some((j: any) => j.id === created.job_id)).toBe(true);
+}, 30000);
+
+test("POST /api/enrich runs running -> failed when nothing resolves", async () => {
+  await bootApi();
+  const post = await fetch(`${API_BASE}/api/enrich`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: UNRESOLVABLE }),
+  });
+  expect(post.status).toBe(201);
+  const created: any = await post.json();
+  lifecycleJobIds.push(created.job_id);
+
+  const failed = await pollEnrichJob(created.job_id, ["done", "failed"]);
+  expect(failed.status).toBe("failed");
+  expect(String(failed.error)).toMatch(/couldn't resolve/i);
+}, 30000);
+
+test("POST /api/enrich 400s without a query; GET 404s unknown jobs", async () => {
+  await bootApi();
+  const bad = await fetch(`${API_BASE}/api/enrich`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ query: "   " }),
+  });
+  expect(bad.status).toBe(400);
+  const missing = await fetch(`${API_BASE}/api/enrich/enope123`);
+  expect(missing.status).toBe(404);
+}, 30000);
+
+// Remove the lifecycle jobs so the dev database stays clean.
+test("lifecycle cleanup", async () => {
+  const { db } = await import("./db");
+  for (const id of lifecycleJobIds)
+    db.query("DELETE FROM enrich_jobs WHERE id = ?").run(id);
+  expect(lifecycleJobIds.length).toBe(2);
 });

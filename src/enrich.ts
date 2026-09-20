@@ -300,6 +300,10 @@ function withoutScripts(html: string): string {
 export function extractPrincipals(
   html: string, sourceUrl: string, domain: string,
 ): EnrichPrincipal[] {
+  // Defense in depth: never attribute a principal to an off-domain or
+  // blocked (social/search/data-broker) page, even if a caller forgets to
+  // filter its URLs first.
+  if (!isScrapableUrl(sourceUrl, domain)) return [];
   const out: EnrichPrincipal[] = [];
   const seen = new Map<string, number>(); // normalized name -> index in out
   const push = (name: string, title: string, email?: string) => {
