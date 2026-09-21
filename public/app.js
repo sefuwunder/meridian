@@ -1460,6 +1460,36 @@ $("keysClose").onclick = () => { $("keysModal").hidden = true; };
 // new recon form — checkboxes are generated from /api/source-defs (the
 // server's SOURCE_DEFS), so new collectors appear automatically. The static
 // list below is a fallback for when the server can't be reached.
+// The scope toggle (full recon / business data only) filters the checked
+// boxes client-side AND sends business_only to the server, which enforces
+// the same filter — default is full recon; only Milton-initiated runs are
+// forced to business-only by the router.
+const FALLBACK_BUSINESS = new Set([
+  "overpass", "business", "gleif", "nonprofits", "fdic",
+  "gleifname", "secedgar", "wikidataorg", "hkcr", "enhetsregisteret",
+]);
+function reconScope() {
+  const all = document.querySelectorAll('input[name="reconScope"]');
+  for (const r of all) if (r.checked) return r.value;
+  return "full";
+}
+function applyScopeToChecks() {
+  const biz = reconScope() === "business";
+  for (const input of document.querySelectorAll("#sourceChecks input")) {
+    const isBiz = input.dataset.business === "1" || input.value === "geocode";
+    const label = input.closest("label");
+    if (biz && !isBiz) {
+      // business-only scope: non-business sources are excluded and locked off
+      input.checked = false;
+      input.disabled = true;
+      if (label) label.classList.add("disabled");
+    } else {
+      if (input.value !== "geocode") input.disabled = false;
+      input.checked = true;
+      if (label) label.classList.remove("disabled");
+    }
+  }
+}
 async function renderSourceChecks() {
   const box = $("sourceChecks");
   let defs = null;
@@ -1468,38 +1498,42 @@ async function renderSourceChecks() {
     if (Array.isArray(r.sources) && r.sources.length) defs = r.sources;
   } catch { /* fall through to the static list */ }
   const items = defs
-    ? defs.map((d) => [d.key, d.label.replace(/^.* · /, "")])
+    ? defs.map((d) => [d.key, d.label.replace(/^.* · /, ""), !!d.business])
     : [
-    ["geocode", "geocode"], ["overpass", "places"], ["wikipedia", "profile"],
-    ["business", "companies"], ["people", "people"], ["music", "music"],
-    ["news", "news"], ["country", "country"], ["moneytime", "money+time"], ["weather", "weather"],
-    ["gdelt", "events"], ["gleif", "legal entities"], ["opensky", "aircraft"], ["openalex", "research"],
-    ["gdacs", "disasters"], ["chronicling", "historic press"],
-    ["icij", "offshore leaks"], ["occrp", "investigations"], ["urlscan", "web scans"],
-    ["nonprofits", "nonprofits"], ["openfec", "campaign finance"],
-    ["ipquery", "IP intel"], ["fdic", "banks"], ["arquivo", "web archive"], ["wigle", "wireless"],
-    ["internetdb", "IP ports/vulns"], ["adsblol", "live aircraft"], ["eonet", "natural events"],
-    ["usgs", "earthquakes"], ["hackertarget", "infra recon"], ["mnemonic", "passive DNS"],
-    ["certspotter", "cert transparency"], ["brasilapi", "brazil data"],
-    ["gleifname", "entity search"], ["secedgar", "SEC filers"], ["wikidataorg", "organizations"],
-    ["hkcr", "HK companies"], ["enhetsregisteret", "norwegian entities"],
-    ["enrich", "company principals"],
+    ["geocode", "geocode", false], ["overpass", "places", true], ["wikipedia", "profile", false],
+    ["business", "companies", true], ["people", "people", false], ["music", "music", false],
+    ["news", "news", false], ["country", "country", false], ["moneytime", "money+time", false], ["weather", "weather", false],
+    ["gdelt", "events", false], ["gleif", "legal entities", true], ["opensky", "aircraft", false], ["openalex", "research", false],
+    ["gdacs", "disasters", false], ["chronicling", "historic press", false],
+    ["icij", "offshore leaks", false], ["occrp", "investigations", false], ["urlscan", "web scans", false],
+    ["nonprofits", "nonprofits", true], ["openfec", "campaign finance", false],
+    ["ipquery", "IP intel", false], ["fdic", "banks", true], ["arquivo", "web archive", false], ["wigle", "wireless", false],
+    ["internetdb", "IP ports/vulns", false], ["adsblol", "live aircraft", false], ["eonet", "natural events", false],
+    ["usgs", "earthquakes", false], ["hackertarget", "infra recon", false], ["mnemonic", "passive DNS", false],
+    ["certspotter", "cert transparency", false], ["brasilapi", "brazil data", false],
+    ["gleifname", "entity search", true], ["secedgar", "SEC filers", true], ["wikidataorg", "organizations", true],
+    ["hkcr", "HK companies", true], ["enhetsregisteret", "norwegian entities", true],
+    ["enrich", "company principals", false],
   ];
-  for (const [key, label] of items) {
+  for (const [key, label, biz] of items) {
     const l = document.createElement("label");
-    l.innerHTML = `<input type="checkbox" checked ${key === "geocode" ? "disabled" : ""} value="${key}"><span></span>`;
+    l.innerHTML = `<input type="checkbox" checked ${key === "geocode" ? "disabled" : ""} value="${key}" data-business="${biz ? 1 : 0}"><span></span>`;
     l.querySelector("span").textContent = label;
     box.appendChild(l);
   }
+  for (const r of document.querySelectorAll('input[name="reconScope"]'))
+    r.addEventListener("change", applyScopeToChecks);
+  applyScopeToChecks();
 }
 $("btnLaunch").onclick = async () => {
   const city = $("cityInput").value.trim();
   if (!city) { $("cityInput").focus(); return; }
   const sources = [...document.querySelectorAll("#sourceChecks input:checked")].map((i) => i.value);
+  const businessOnly = reconScope() === "business";
   const btn = $("btnLaunch");
   btn.disabled = true; btn.textContent = "launching…";
   try {
-    const { id } = await api("/api/recon", { method: "POST", body: JSON.stringify({ city, sources }) });
+    const { id } = await api("/api/recon", { method: "POST", body: JSON.stringify({ city, sources, business_only: businessOnly }) });
     $("cityInput").value = "";
     await loadRecon(id, true);
   } catch (e) {

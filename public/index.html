@@ -30,6 +30,10 @@
     <h3>new recon sprint</h3>
     <input id="cityInput" placeholder="city — e.g. Dakar, Senegal" autocomplete="off">
     <div class="sources-check" id="sourceChecks"></div>
+    <div class="scope-toggle" role="radiogroup" aria-label="recon scope">
+      <label><input type="radio" name="reconScope" value="full" checked> full recon</label>
+      <label><input type="radio" name="reconScope" value="business"> business data only</label>
+    </div>
     <button id="btnLaunch" class="primary">launch recon</button>
     <p class="fine">nineteen keyless sources plus two keyed-free ones. failures are contained — one dead source never kills the sprint.</p>
   </section>

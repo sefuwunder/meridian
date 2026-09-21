@@ -11,6 +11,7 @@ import { resolveDomain, enrichCompanySite } from "./enrich";
 import { runProspect } from "./prospect";
 import {
   initRouter, setRouterBase, requestRun, validateRunInput, listRuns, runDetail,
+  applyBusinessOnly,
 } from "./router";
 import {
   SOURCE_DEFS, mergeGraph, addKeywordEdges, cityExcludeTokens, deepSearchNode,
@@ -261,7 +262,7 @@ const server = Bun.serve({
       if (path === "/api/keys" && method === "GET") return json({ keys: keyStatuses() });
       // ---------- source defs (drives the launch-form checkboxes; never hardcode) ----------
       if (path === "/api/source-defs" && method === "GET")
-        return json({ sources: SOURCE_DEFS.map((d) => ({ key: d.key, label: d.label })) });
+        return json({ sources: SOURCE_DEFS.map((d) => ({ key: d.key, label: d.label, business: d.business })) });
       if (path === "/api/keys" && method === "POST") {
         const b = await readBody(req);
         const id = String(b.key || "");
@@ -480,9 +481,14 @@ const server = Bun.serve({
         const b = await readBody(req);
         const city = String(b.city || "").trim();
         if (!city) return json({ error: "city is required" }, 400);
-        const wanted: string[] = Array.isArray(b.sources) && b.sources.length
+        let wanted: string[] = Array.isArray(b.sources) && b.sources.length
           ? b.sources.filter((k: string) => SOURCE_DEFS.some((d) => d.key === k))
           : SOURCE_DEFS.map((d) => d.key);
+        if (b.business_only === true) {
+          wanted = applyBusinessOnly(wanted);
+          if (!wanted.some((k) => k !== "geocode"))
+            return json({ error: "business_only: none of the requested sources emit business data" }, 400);
+        }
         if (!wanted.includes("geocode")) wanted.unshift("geocode");
         const id = "r" + Date.now().toString(36) + Math.random().toString(36).slice(2, 7);
         const states = SOURCE_DEFS.filter((d) => wanted.includes(d.key))

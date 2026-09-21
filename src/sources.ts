@@ -2228,47 +2228,66 @@ export async function collectEnrich(ctx: Ctx): Promise<SourceResult> {
   };
 }
 
+// ---------- source registry ----------
+// `business` classifies each collector for business-only recon runs
+// (e.g. runs initiated from Milton): true ONLY when the collector emits
+// business entities — companies, legal entities, organizations, filings,
+// registries, business places. Everything emitting people, news, events,
+// weather, aircraft, IP/infra, web scans, disasters, music, research
+// papers, or mixed payloads including any of those is false. When in
+// doubt, exclude: a missing/new source must default to false (there is an
+// exhaustiveness test enforcing every entry carries an explicit boolean).
+//
+// `geocode` is plumbing, not data: it resolves the city to coordinates for
+// the hub pin and searches nothing. It is business:false but stays included
+// in BOTH modes — the run router always ensures it (see router.ts).
 export const SOURCE_DEFS = [
-  { key: "geocode", label: "Geocode · OpenStreetMap" },
-  { key: "overpass", label: "Places · OpenStreetMap" },
-  { key: "wikipedia", label: "Profile · Wikipedia" },
-  { key: "business", label: "Companies · Wikidata" },
-  { key: "people", label: "People · Wikidata" },
-  { key: "music", label: "Music scene · MusicBrainz" },
-  { key: "news", label: "Headlines · Google News" },
-  { key: "country", label: "Country dossier · REST Countries" },
-  { key: "moneytime", label: "Money & time · ER API" },
-  { key: "weather", label: "Weather · Open-Meteo" },
-  { key: "gdelt", label: "Events · GDELT" },
-  { key: "gleif", label: "Legal entities · GLEIF" },
-  { key: "opensky", label: "Live aircraft · OpenSky" },
-  { key: "openalex", label: "Research · OpenAlex" },
-  { key: "gdacs", label: "Disasters · GDACS" },
-  { key: "chronicling", label: "Historic press · Library of Congress" },
-  { key: "icij", label: "Offshore leaks · ICIJ" },
-  { key: "occrp", label: "Investigations · OCCRP Aleph" },
-  { key: "urlscan", label: "Web scans · urlscan.io" },
-  { key: "ipquery", label: "IP intel · IPQuery" },
-  { key: "nonprofits", label: "Nonprofits · ProPublica" },
-  { key: "openfec", label: "Campaign finance · OpenFEC" },
-  { key: "fdic", label: "Banks · FDIC" },
-  { key: "arquivo", label: "Web archive · Arquivo.pt" },
-  { key: "wigle", label: "Wireless · WiGLE" },
-  { key: "internetdb", label: "IP ports/vulns · Shodan InternetDB" },
-  { key: "adsblol", label: "Live aircraft · adsb.lol" },
-  { key: "eonet", label: "Natural events · NASA EONET" },
-  { key: "usgs", label: "Earthquakes · USGS" },
-  { key: "hackertarget", label: "Infra recon · HackerTarget" },
-  { key: "mnemonic", label: "Passive DNS · mnemonic" },
-  { key: "certspotter", label: "Cert transparency · Cert Spotter" },
-  { key: "brasilapi", label: "Brazil data · brasilapi" },
-  { key: "gleifname", label: "Entity search · GLEIF" },
-  { key: "secedgar", label: "Filers · SEC EDGAR" },
-  { key: "wikidataorg", label: "Organizations · Wikidata" },
-  { key: "hkcr", label: "HK companies · Companies Registry" },
-  { key: "enhetsregisteret", label: "Norwegian entities · Enhetsregisteret" },
-  { key: "enrich", label: "Enrichment · company principals" },
+  { key: "geocode", label: "Geocode · OpenStreetMap", business: false },          // plumbing — always on
+  { key: "overpass", label: "Places · OpenStreetMap", business: true },           // business places (shops, offices, hotels…)
+  { key: "wikipedia", label: "Profile · Wikipedia", business: false },           // city profile, general web
+  { key: "business", label: "Companies · Wikidata", business: true },             // companies/orgs
+  { key: "people", label: "People · Wikidata", business: false },                 // individuals
+  { key: "music", label: "Music scene · MusicBrainz", business: false },         // music
+  { key: "news", label: "Headlines · Google News", business: false },             // news
+  { key: "country", label: "Country dossier · REST Countries", business: false }, // general dossier
+  { key: "moneytime", label: "Money & time · ER API", business: false },         // FX/time, not entities
+  { key: "weather", label: "Weather · Open-Meteo", business: false },             // weather
+  { key: "gdelt", label: "Events · GDELT", business: false },                     // events/news
+  { key: "gleif", label: "Legal entities · GLEIF", business: true },             // legal-entity registry
+  { key: "opensky", label: "Live aircraft · OpenSky", business: false },          // aircraft
+  { key: "openalex", label: "Research · OpenAlex", business: false },            // papers/researchers
+  { key: "gdacs", label: "Disasters · GDACS", business: false },                  // disasters
+  { key: "chronicling", label: "Historic press · Library of Congress", business: false }, // historic press, mixed incl. people
+  { key: "icij", label: "Offshore leaks · ICIJ", business: false },              // leaks, mixed incl. people
+  { key: "occrp", label: "Investigations · OCCRP Aleph", business: false },      // investigations, mixed incl. people
+  { key: "urlscan", label: "Web scans · urlscan.io", business: false },          // web scans/infra
+  { key: "ipquery", label: "IP intel · IPQuery", business: false },              // IP intel
+  { key: "nonprofits", label: "Nonprofits · ProPublica", business: true },       // nonprofit org registry
+  { key: "openfec", label: "Campaign finance · OpenFEC", business: false },      // donors (individuals)
+  { key: "fdic", label: "Banks · FDIC", business: true },                        // bank registry
+  { key: "arquivo", label: "Web archive · Arquivo.pt", business: false },        // web archive
+  { key: "wigle", label: "Wireless · WiGLE", business: false },                  // wireless
+  { key: "internetdb", label: "IP ports/vulns · Shodan InternetDB", business: false }, // IP vulns
+  { key: "adsblol", label: "Live aircraft · adsb.lol", business: false },        // aircraft
+  { key: "eonet", label: "Natural events · NASA EONET", business: false },      // natural events
+  { key: "usgs", label: "Earthquakes · USGS", business: false },                 // earthquakes
+  { key: "hackertarget", label: "Infra recon · HackerTarget", business: false }, // infra
+  { key: "mnemonic", label: "Passive DNS · mnemonic", business: false },         // passive DNS
+  { key: "certspotter", label: "Cert transparency · Cert Spotter", business: false }, // certs/infra
+  { key: "brasilapi", label: "Brazil data · brasilapi", business: false },       // mixed incl. person partners
+  { key: "gleifname", label: "Entity search · GLEIF", business: true },          // legal-entity search
+  { key: "secedgar", label: "Filers · SEC EDGAR", business: true },              // SEC filers (companies)
+  { key: "wikidataorg", label: "Organizations · Wikidata", business: true },     // organizations
+  { key: "hkcr", label: "HK companies · Companies Registry", business: true },   // HK company registry
+  { key: "enhetsregisteret", label: "Norwegian entities · Enhetsregisteret", business: true }, // NO entity registry
+  { key: "enrich", label: "Enrichment · company principals", business: false },  // emits executive person nodes
 ];
+
+// Keys that may run in a business-only recon (geocode plumbing is handled
+// separately — it is always included by the router).
+export const BUSINESS_SOURCES: ReadonlySet<string> = new Set(
+  SOURCE_DEFS.filter((d) => d.business).map((d) => d.key)
+);
 
 // ---------- keyword interlinking ----------
 // Any two non-city nodes sharing a keyword get an edge labeled with the

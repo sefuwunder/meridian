@@ -8,7 +8,7 @@
 // No auth: the router is for trusted local consumers only.
 
 import { db, createRecon, getRecon } from "./db";
-import { SOURCE_DEFS } from "./sources";
+import { SOURCE_DEFS, BUSINESS_SOURCES } from "./sources";
 
 db.exec(`
 CREATE TABLE IF NOT EXISTS runs (
@@ -28,11 +28,19 @@ CREATE TABLE IF NOT EXISTS runs (
   finished_at INTEGER
 );`);
 
+// Migration: scope flag for business-only runs (Milton-initiated). SQLite
+// has no ADD COLUMN IF NOT EXISTS, so check first.
+{
+  const cols = db.query(`PRAGMA table_info(runs)`).all() as { name: string }[];
+  if (!cols.some((c) => c.name === "business_only"))
+    db.exec(`ALTER TABLE runs ADD COLUMN business_only INTEGER NOT NULL DEFAULT 0`);
+}
+
 const now = () => Date.now();
 
 export interface RunRow {
   id: string; recon_id: string; city: string; label: string | null;
-  status: string; sources_json: string;
+  status: string; sources_json: string; business_only: number;
   callback_url: string | null; callback_headers_json: string;
   callback_state: string; callback_status: number | null; callback_at: number | null;
   created_at: number; started_at: number | null; finished_at: number | null;
@@ -44,6 +52,7 @@ export interface ValidatedRun {
   city: string;
   wanted: string[];          // source keys, geocode ensured later
   label: string | null;
+  businessOnly: boolean;     // true: business-data sources only (+ geocode plumbing)
   callbackUrl: string | null;
   callbackHeaders: Record<string, string>;
 }
@@ -99,6 +108,12 @@ export function validateRunInput(b: any): ValidatedRun {
       .filter((k: string) => SOURCE_DEFS.some((d) => d.key === k));
     if (filtered.length) wanted = filtered; // all-unknown → fall back to all sources
   }
+  const businessOnly = b?.business_only === true;
+  if (businessOnly) {
+    wanted = applyBusinessOnly(wanted);
+    if (!wanted.some((k) => BUSINESS_SOURCES.has(k)))
+      throw new Error("business_only: none of the requested sources emit business data");
+  }
   const rawLabel = b?.label;
   const label = rawLabel === undefined || rawLabel === null
     ? null
@@ -107,9 +122,16 @@ export function validateRunInput(b: any): ValidatedRun {
     city,
     wanted,
     label,
+    businessOnly,
     callbackUrl: validateCallbackUrl(b?.callback_url),
     callbackHeaders: validateCallbackHeaders(b?.callback_headers),
   };
+}
+
+// Business-only scope: keep geocode plumbing plus sources classified as
+// business data. Shared by POST /api/runs and POST /api/recon.
+export function applyBusinessOnly(wanted: string[]): string[] {
+  return wanted.filter((k) => k === "geocode" || BUSINESS_SOURCES.has(k));
 }
 
 // ------------------------------------------------------------------- storage
@@ -121,6 +143,7 @@ export function getRun(id: string): RunRow | null {
 export function listRuns(): any[] {
   return db.query(`
     SELECT r.id AS run_id, r.recon_id, r.city, r.label, r.status,
+           r.business_only AS business_only,
            r.created_at, r.started_at, r.finished_at,
            COALESCE(json_array_length(rc.nodes_json), 0) AS nodes,
            COALESCE(json_array_length(rc.edges_json), 0) AS edges
@@ -146,6 +169,7 @@ export function runDetail(id: string, origin: string): any | null {
     city: run.city,
     label: run.label,
     status: run.status,
+    business_only: run.business_only === 1,
     created_at: run.created_at,
     started_at: run.started_at,
     finished_at: run.finished_at,
@@ -197,11 +221,11 @@ export function requestRun(v: ValidatedRun): { run_id: string; status: string } 
   createRecon(reconId, v.city, states);
   const runId = "run_" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
   db.query(
-    `INSERT INTO runs (id, recon_id, city, label, status, sources_json,
+    `INSERT INTO runs (id, recon_id, city, label, status, sources_json, business_only,
                        callback_url, callback_headers_json, created_at)
-     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?)`
+     VALUES (?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)`
   ).run(runId, reconId, v.city, v.label, JSON.stringify(wanted),
-    v.callbackUrl, JSON.stringify(v.callbackHeaders), now());
+    v.businessOnly ? 1 : 0, v.callbackUrl, JSON.stringify(v.callbackHeaders), now());
   // pumpQueue starts the run synchronously up to its first await, so the
   // status we read back here is already 'running' unless another run is
   // active, in which case it stays 'queued'.

@@ -83,6 +83,11 @@ in the collection panel and the sprint continues. Nothing is ever half-merged �
 nodes dedupe by id, edges dedupe by endpoints + label, and edges pointing at
 missing nodes are dropped.
 
+Each source is classified in `src/sources.ts` (`SOURCE_DEFS[].business`) for
+business-only runs: business data (companies, legal entities, organizations,
+filings, registries, business places) vs everything else. `geocode` is plumbing
+(city → coordinates, searches nothing) and always runs in both modes.
+
 ## Keyword interlinking
 
 Beyond the hub spokes, any two nodes sharing a keyword are connected by a
@@ -279,6 +284,28 @@ Contract:
   `city` is required; `sources` is filtered against the known collector keys
   (unknown keys are dropped, `geocode` always runs first); `label` is an
   optional tag (≤120 chars).
+- **Business-only scope:** `POST /api/runs` (and `POST /api/recon`) accept
+  `"business_only": true`. The run is restricted to sources classified as
+  business data, plus `geocode` plumbing (which resolves the city to
+  coordinates for the hub pin and searches nothing). Every other source —
+  people, news, events, weather, aircraft, IP/infra, web scans, disasters,
+  music, research, and any mixed source emitting those — is excluded. If an
+  explicit `sources` list is given, it is intersected with the business
+  allowlist; when nothing business remains the request fails with 400.
+  The scope is stored on the run and exposed as `business_only` by
+  `GET /api/runs` and `GET /api/runs/:id`.
+- **Rule:** recon runs initiated from Milton are always business-only —
+  Milton sends `business_only: true` on every `POST /api/runs`, with no
+  opt-out. The launch form in the UI defaults to a full recon; its
+  "business data only" toggle applies the same filter server-side.
+- Business-data sources (`business: true` in `src/sources.ts`): `overpass`
+  (business places), `business` (Wikidata companies), `gleif` and
+  `gleifname` (legal-entity registry), `nonprofits` (ProPublica registry),
+  `fdic` (bank registry), `secedgar` (SEC filers), `wikidataorg`
+  (organizations), `hkcr` (HK company registry), `enhetsregisteret`
+  (Norwegian entity registry). Each `SOURCE_DEFS` entry carries an explicit
+  `business` boolean; a new source without one fails the test suite
+  (default-deny, never default-allow).
 - `callback_url` must be `http(s)`, else 400. `callback_headers` is an
   optional object with the same strict rules as webhook headers: RFC token
   names, ≤20 headers, name/value ≤2KB each, no CR/LF, and framing headers
