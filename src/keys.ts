@@ -46,6 +46,14 @@ export const KEY_DEFS: KeyDef[] = [
     signup: "https://wigle.net/account",
     signupLabel: "free API name + token at wigle.net/account (store as ApiName:ApiToken)",
   },
+  {
+    id: "EXA_API_KEY",
+    name: "Exa",
+    required: true,
+    benefit: "activates the Exa web-search source — keyword web search across news, people, companies and blogs (~1,000 searches/month free tier)",
+    signup: "https://dashboard.exa.ai/",
+    signupLabel: "free key at dashboard.exa.ai",
+  },
 ];
 
 let cache: Record<string, string> | null = null;

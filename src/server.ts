@@ -25,7 +25,7 @@ import {
   collectInternetdb, collectAdsblol, collectEonet, collectUsgs,
   collectHackertarget, collectMnemonic, collectCertspotter, collectBrasilapi,
   collectGleifName, collectSecEdgar, collectWikidataOrg,
-  collectHkcr, collectEnhetsregisteret, collectEnrich,
+  collectHkcr, collectEnhetsregisteret, collectExa, collectEnrich,
   probeKeySource,
   type Ctx, type GNode, type GEdge, type SourceResult,
 } from "./sources";
@@ -83,6 +83,7 @@ const COLLECTORS: Record<string, (ctx: Ctx) => Promise<SourceResult>> = {
   wikidataorg: collectWikidataOrg,
   hkcr: collectHkcr,
   enhetsregisteret: collectEnhetsregisteret,
+  exa: collectExa,
   enrich: collectEnrich,
 };
 

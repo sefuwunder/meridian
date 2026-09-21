@@ -1,5 +1,5 @@
 // meridian — OSINT collectors. Most sources are free and keyless; the
-// keyed-free ones (OCCRP Aleph, OpenFEC) read their keys through
+// keyed-free ones (OCCRP Aleph, OpenFEC, Exa) read their keys through
 // ./keys (env var wins, then the Keys screen, then none).
 // Each collector returns graph nodes + edges; failures throw and are
 // recorded per-source by the runner (best-effort: one dead source never
@@ -2228,6 +2228,124 @@ export async function collectEnrich(ctx: Ctx): Promise<SourceResult> {
   };
 }
 
+// ---------- 40. web search (Exa) ----------
+// Keyword-driven, keyed source: company-name keywords from stashed domains
+// are searched via Exa's JSON API (POST api.exa.ai/search, x-api-key header,
+// type:"keyword" with text:true snippets). Exa returns mixed general-web
+// payloads (news, people, companies, blogs), so this is business:false —
+// excluded from Milton business-only runs (see the "when in doubt,
+// exclude" rule above the registry). Quota-capped at 3 keywords ×
+// 5 results per run (the free tier is ~1,000 searches/month, shared with
+// the user's other tooling). Failures throw; the runner records them
+// per-source so one dead source never kills the recon.
+
+const EXA_API = "https://api.exa.ai/search";
+const EXA_RESULTS = 5;
+const EXA_TIMEOUT_MS = 25000;
+
+export interface ExaResult { title: string; url: string; snippet: string }
+
+// Tracking-parameter-stripped, lowercased URL used for cross-query dedupe.
+export function normalizeWebUrl(u: string): string {
+  try {
+    const x = new URL(u);
+    x.hash = "";
+    for (const k of [...x.searchParams.keys()])
+      if (/^(utm_|gclid$|gclsrc|fbclid|igshid|mc_|yclid|_hsenc)/i.test(k))
+        x.searchParams.delete(k);
+    return x.href.replace(/\/$/, "").toLowerCase();
+  } catch {
+    return String(u || "").toLowerCase();
+  }
+}
+
+// Defensive: missing titles fall back to the URL, missing text falls back
+// to the first highlight; junk (no http(s) URL) is dropped.
+export function parseExaResults(j: any, cap = EXA_RESULTS): ExaResult[] {
+  const arr = Array.isArray(j?.results) ? j.results : [];
+  const out: ExaResult[] = [];
+  const seen = new Set<string>();
+  for (const r of arr) {
+    if (!r || typeof r !== "object") continue;
+    const url = String(r.url || "").trim();
+    if (!/^https?:\/\//i.test(url)) continue;
+    const norm = normalizeWebUrl(url);
+    if (seen.has(norm)) continue;
+    seen.add(norm);
+    const title = String(r.title || "").trim() || url;
+    let snippet = "";
+    if (typeof r.text === "string" && r.text.trim()) snippet = r.text.trim();
+    else if (Array.isArray(r.highlights) && typeof r.highlights[0] === "string")
+      snippet = r.highlights[0].trim();
+    out.push({ title: title.slice(0, 90), url, snippet: snippet.slice(0, 300) });
+    if (out.length >= cap) break;
+  }
+  return out;
+}
+
+async function exaSearch(query: string, key: string, numResults: number): Promise<any> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), EXA_TIMEOUT_MS);
+  try {
+    const r = await fetch(EXA_API, {
+      method: "POST",
+      signal: ctrl.signal,
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": UA,
+        "x-api-key": key,
+      },
+      body: JSON.stringify({ query, numResults, type: "keyword", text: true }),
+    });
+    if (r.status === 401)
+      throw new Error("exa: invalid API key (HTTP 401) — check EXA_API_KEY on the Keys screen");
+    if (r.status === 402)
+      throw new Error("exa: free quota exhausted (HTTP 402) — renews monthly");
+    if (r.status === 429)
+      throw new Error("exa: rate-limited (HTTP 429) — paused for this run");
+    if (!r.ok) throw new Error(`HTTP ${r.status} from api.exa.ai`);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+
+export async function collectExa(ctx: Ctx): Promise<SourceResult> {
+  const key = resolveKey("EXA_API_KEY");
+  if (!key) {
+    return {
+      nodes: [], edges: [],
+      note: "idle — add a free Exa key on the Keys screen (top bar) to activate",
+    };
+  }
+  const pairs = companyKeywordPairs(ctx, 3);
+  if (!pairs.length)
+    return { nodes: [], edges: [], note: "no company keywords — no domains stashed this run" };
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  for (const { kw, domain } of pairs) {
+    const j = await exaSearch(kw, key, EXA_RESULTS);
+    for (const r of parseExaResults(j, EXA_RESULTS)) {
+      const norm = normalizeWebUrl(r.url);
+      if (seen.has(norm)) continue;
+      seen.add(norm);
+      const id = `exa:${slug(r.url)}`;
+      nodes.push({
+        id, label: r.title, type: "data" as NodeType, subtype: "web",
+        source: "exa", detail: r.snippet, url: r.url,
+      });
+      // Link back to the stashed-company node by convention
+      // (urlscan:domain:<slug>, like the other keyword-driven sources);
+      // mergeGraph drops the edge if that source wasn't ticked, so the
+      // city hub is always added as the guaranteed anchor.
+      edges.push({ from: `urlscan:domain:${slug(domain)}`, to: id, label: "web result" });
+      edges.push({ from: ctx.cityId, to: id, label: "web result" });
+    }
+  }
+  return {
+    nodes, edges,
+    note: `${nodes.length} web results for ${pairs.map((p) => p.kw).join(", ")}`,
+  };
+}
+
 // ---------- source registry ----------
 // `business` classifies each collector for business-only recon runs
 // (e.g. runs initiated from Milton): true ONLY when the collector emits
@@ -2280,6 +2398,7 @@ export const SOURCE_DEFS = [
   { key: "wikidataorg", label: "Organizations · Wikidata", business: true },     // organizations
   { key: "hkcr", label: "HK companies · Companies Registry", business: true },   // HK company registry
   { key: "enhetsregisteret", label: "Norwegian entities · Enhetsregisteret", business: true }, // NO entity registry
+  { key: "exa", label: "Web search · Exa", business: false },                   // keyword web search — mixed payloads incl. people/news
   { key: "enrich", label: "Enrichment · company principals", business: false },  // emits executive person nodes
 ];
 
@@ -2539,6 +2658,11 @@ export async function probeKeySource(id: string, key: string): Promise<{ ok: boo
       { headers: { Authorization: `Basic ${basic}` } }, 15000);
     if (j?.success === false) throw new Error(String(j.message || "rejected").slice(0, 120));
     return { ok: true, detail: "authenticated — area search accepted" };
+  }
+  if (id === "EXA_API_KEY") {
+    const j = await exaSearch("test", key, 1);
+    const n = Array.isArray(j?.results) ? j.results.length : 0;
+    return { ok: true, detail: `authenticated — probe search returned (${n} result${n === 1 ? "" : "s"})` };
   }
   throw new Error(`no probe for key ${id}`);
 }

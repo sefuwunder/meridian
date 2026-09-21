@@ -3,8 +3,8 @@
 Land in a foreign city, launch a recon sprint, and watch social, cultural, and
 business intel assemble itself into an interactive web of connected nodes.
 
-`meridian` collects from **thirty-eight free, keyless sources** plus three optional
-keyed-free ones (OCCRP Aleph and WiGLE need free API credentials to activate;
+`meridian` collects from **thirty-eight free, keyless sources** plus four optional
+keyed-free ones (OCCRP Aleph, WiGLE and Exa need free API credentials to activate;
 OpenFEC works out of the box on a low demo quota and accepts a free personal
 key for the full rate). It lays the results out as a force-directed node graph: the city
 sits pinned at the hub, everything else — restaurants, museums, coworking
@@ -29,6 +29,7 @@ only (last 4 chars) and has a per-key live test.
 ```bash
 OCCRP_API_KEY=...    # free account at data.occrp.org — activates the OCCRP Aleph collector
 OPENFEC_API_KEY=...  # free personal key at api.open.fec.gov — raises OpenFEC from 30/hr to 1,000/hr
+EXA_API_KEY=...               # free key at dashboard.exa.ai — activates the Exa web-search source
 ```
 
 Type a city, tick the sources you want, hit **launch recon**. Collection runs in
@@ -77,6 +78,7 @@ the header tracks elapsed time.
 | 36 | Wikidata org search | keyless: `wbsearchentities` for the company keyword, then one batched `wbgetentities` call; only items whose direct P31 is a known org class (company, business, public company, enterprise, corporation, technology company) become org nodes. No SPARQL — the transitive path query 502s/times out on the public endpoint. 3 keywords × 2 requests. Idles when no domains were stashed. |
 | 37 | HK Companies Registry | keyless (data.cr.gov.hk, refreshed daily): prefix-only company-name search for keywords derived from the recon's stashed domains → org nodes (BRN, registered office address, company type, incorporation date) linked to the city hub and back to the matching domain node. Live local companies only — no officers, filings, or dissolved entities. 3 keywords × 1 request. Idles when no domains were stashed. |
 | 38 | Enhetsregisteret | keyless (data.brreg.no, NLOD 2.0): entities registered in the recon city via native municipality scoping — the city maps to a 4-digit kommunenummer through a built-in table of the largest kommuner. One request per recon (≤25 org nodes with org.nr, legal form, business address, activity, konkurs/avvikling flags). Norway-only; idles elsewhere and for cities outside the table. |
+| 39 | Exa | keyed-free: keyword web search (`type:"keyword"`, snippet text) for company-name keywords derived from the recon's stashed domains → web-result nodes (title, snippet, URL) linked to the city hub and back to the matching domain node. Mixed general-web payloads (news, people, companies, blogs), so excluded from business-only runs. Capped at 3 keywords × 5 results per run (~1,000 searches/month free tier). Idles with a setup hint until `EXA_API_KEY` is configured, and when no domains were stashed. |
 
 Every source is best-effort and independent: one dead API marks its row failed
 in the collection panel and the sprint continues. Nothing is ever half-merged —
