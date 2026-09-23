@@ -54,6 +54,14 @@ export const KEY_DEFS: KeyDef[] = [
     signup: "https://dashboard.exa.ai/",
     signupLabel: "free key at dashboard.exa.ai",
   },
+  {
+    id: "PARALLEL_API_KEY",
+    name: "Parallel",
+    required: true,
+    benefit: "activates the Parallel web-search source — natural-language web search with LLM-optimized excerpts across news, companies and blogs",
+    signup: "https://platform.parallel.ai",
+    signupLabel: "API key at platform.parallel.ai",
+  },
 ];
 
 let cache: Record<string, string> | null = null;

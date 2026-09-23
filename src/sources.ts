@@ -2346,6 +2346,123 @@ export async function collectExa(ctx: Ctx): Promise<SourceResult> {
   };
 }
 
+// ---------- 41. web search (Parallel) ----------
+// Keyword-driven, keyed source: company-name keywords from stashed domains
+// are searched via Parallel's Search API (POST api.parallel.ai/v1/search,
+// Bearer auth, objective + search_queries with LLM-optimized excerpts).
+// Parallel returns mixed general-web payloads (news, people, companies,
+// blogs), so this is business:false — excluded from Milton business-only
+// runs (see the "when in doubt, exclude" rule above the registry).
+// Quota-capped at 3 keywords per run; mode "basic" keeps latency low and
+// max_chars_total caps excerpt volume per call. Failures throw; the runner
+// records them per-source so one dead source never kills the recon.
+
+const PARALLEL_API = "https://api.parallel.ai/v1/search";
+const PARALLEL_RESULTS = 5;
+const PARALLEL_TIMEOUT_MS = 25000;
+
+export interface ParallelResult {
+  title: string; url: string; snippet: string; publishDate: string | null;
+}
+
+// Defensive: missing titles fall back to the URL, excerpts are joined into
+// one snippet; junk (no http(s) URL) is dropped. Dedupe reuses the shared
+// normalizeWebUrl (tracking params stripped) so Exa/Parallel cross-results
+// collapse on the same canonical URL downstream.
+export function parseParallelResults(j: any, cap = PARALLEL_RESULTS): ParallelResult[] {
+  const arr = Array.isArray(j?.results) ? j.results : [];
+  const out: ParallelResult[] = [];
+  const seen = new Set<string>();
+  for (const r of arr) {
+    if (!r || typeof r !== "object") continue;
+    const url = String(r.url || "").trim();
+    if (!/^https?:\/\//i.test(url)) continue;
+    const norm = normalizeWebUrl(url);
+    if (seen.has(norm)) continue;
+    seen.add(norm);
+    const title = String(r.title || "").trim() || url;
+    let snippet = "";
+    if (Array.isArray(r.excerpts))
+      snippet = r.excerpts.filter((e: any) => typeof e === "string").join(" ").trim();
+    out.push({
+      title: title.slice(0, 90), url, snippet: snippet.slice(0, 300),
+      publishDate: typeof r.publish_date === "string" ? r.publish_date : null,
+    });
+    if (out.length >= cap) break;
+  }
+  return out;
+}
+
+async function parallelSearch(objective: string, queries: string[], key: string): Promise<any> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), PARALLEL_TIMEOUT_MS);
+  try {
+    const r = await fetch(PARALLEL_API, {
+      method: "POST",
+      signal: ctrl.signal,
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": UA,
+        "Authorization": `Bearer ${key}`,
+      },
+      body: JSON.stringify({
+        objective, search_queries: queries,
+        mode: "basic", max_chars_total: 6000,
+      }),
+    });
+    if (r.status === 401)
+      throw new Error("parallel: invalid API key (HTTP 401) — check PARALLEL_API_KEY on the Keys screen");
+    if (r.status === 402)
+      throw new Error("parallel: quota exhausted (HTTP 402) — check usage at platform.parallel.ai");
+    if (r.status === 429)
+      throw new Error("parallel: rate-limited (HTTP 429) — paused for this run");
+    if (!r.ok) throw new Error(`HTTP ${r.status} from api.parallel.ai`);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+
+export async function collectParallel(ctx: Ctx): Promise<SourceResult> {
+  const key = resolveKey("PARALLEL_API_KEY");
+  if (!key) {
+    return {
+      nodes: [], edges: [],
+      note: "idle — add a Parallel API key on the Keys screen (top bar) to activate",
+    };
+  }
+  const pairs = companyKeywordPairs(ctx, 3);
+  if (!pairs.length)
+    return { nodes: [], edges: [], note: "no company keywords — no domains stashed this run" };
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  const seen = new Set<string>();
+  for (const { kw, domain } of pairs) {
+    const j = await parallelSearch(
+      `Find recent web results about the company "${kw}" — news, company pages, and mentions.`,
+      [kw], key);
+    for (const r of parseParallelResults(j, PARALLEL_RESULTS)) {
+      const norm = normalizeWebUrl(r.url);
+      if (seen.has(norm)) continue;
+      seen.add(norm);
+      const id = `parallel:${slug(r.url)}`;
+      const detail = [r.snippet, r.publishDate ? `published ${r.publishDate}` : ""]
+        .filter(Boolean).join(" · ");
+      nodes.push({
+        id, label: r.title, type: "data" as NodeType, subtype: "web",
+        source: "parallel", detail, url: r.url,
+      });
+      // Link back to the stashed-company node by convention
+      // (urlscan:domain:<slug>, like the other keyword-driven sources);
+      // mergeGraph drops the edge if that source wasn't ticked, so the
+      // city hub is always added as the guaranteed anchor.
+      edges.push({ from: `urlscan:domain:${slug(domain)}`, to: id, label: "web result" });
+      edges.push({ from: ctx.cityId, to: id, label: "web result" });
+    }
+  }
+  return {
+    nodes, edges,
+    note: `${nodes.length} web results for ${pairs.map((p) => p.kw).join(", ")}`,
+  };
+}
+
 // ---------- source registry ----------
 // `business` classifies each collector for business-only recon runs
 // (e.g. runs initiated from Milton): true ONLY when the collector emits
@@ -2399,6 +2516,7 @@ export const SOURCE_DEFS = [
   { key: "hkcr", label: "HK companies · Companies Registry", business: true },   // HK company registry
   { key: "enhetsregisteret", label: "Norwegian entities · Enhetsregisteret", business: true }, // NO entity registry
   { key: "exa", label: "Web search · Exa", business: false },                   // keyword web search — mixed payloads incl. people/news
+  { key: "parallel", label: "Web search · Parallel", business: false },         // LLM-excerpt web search — mixed payloads incl. people/news
   { key: "enrich", label: "Enrichment · company principals", business: false },  // emits executive person nodes
 ];
 
@@ -2661,6 +2779,11 @@ export async function probeKeySource(id: string, key: string): Promise<{ ok: boo
   }
   if (id === "EXA_API_KEY") {
     const j = await exaSearch("test", key, 1);
+    const n = Array.isArray(j?.results) ? j.results.length : 0;
+    return { ok: true, detail: `authenticated — probe search returned (${n} result${n === 1 ? "" : "s"})` };
+  }
+  if (id === "PARALLEL_API_KEY") {
+    const j = await parallelSearch("Probe query to verify the Parallel API key.", ["parallel api probe"], key);
     const n = Array.isArray(j?.results) ? j.results.length : 0;
     return { ok: true, detail: `authenticated — probe search returned (${n} result${n === 1 ? "" : "s"})` };
   }
