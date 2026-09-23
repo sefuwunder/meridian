@@ -2463,6 +2463,111 @@ export async function collectParallel(ctx: Ctx): Promise<SourceResult> {
   };
 }
 
+// ---------- 42. company discovery (Parallel FindAll entity-search) ----------
+// Keyed source: Parallel's synchronous entity-search endpoint
+// (POST api.parallel.ai/v1beta/findall/entity-search, x-api-key header —
+// NOTE: unlike the v1 Search API above, this beta endpoint authenticates via
+// the x-api-key header, not Bearer). Given a natural-language objective it
+// returns structured company entities {name, url, description} — companies
+// ONLY (entity_type: "companies"), so this is business:true and included in
+// Milton business-only recons.
+// The objective is city-anchored: companies headquartered or operating in
+// the recon city. match_limit 25 per the API's fast-search guidance
+// (results are ranked; relevance declines toward the tail). Failures throw;
+// the runner records them per-source so one dead source never kills the recon.
+
+const PARALLEL_ENTITY_API = "https://api.parallel.ai/v1beta/findall/entity-search";
+const PARALLEL_ENTITY_LIMIT = 25;
+const PARALLEL_ENTITY_TIMEOUT_MS = 60000;
+
+export interface ParallelEntity {
+  name: string; url: string; description: string;
+}
+
+// Defensive: entities need a non-empty name and an http(s) URL; junk is
+// dropped. Dedupe reuses the shared normalizeWebUrl so cross-source
+// duplicates collapse downstream.
+export function parseParallelEntities(j: any, cap = PARALLEL_ENTITY_LIMIT): ParallelEntity[] {
+  const arr = Array.isArray(j?.entities) ? j.entities : [];
+  const out: ParallelEntity[] = [];
+  const seen = new Set<string>();
+  for (const e of arr) {
+    if (!e || typeof e !== "object") continue;
+    const name = String(e.name || "").trim();
+    const url = String(e.url || "").trim();
+    if (!name || !/^https?:\/\//i.test(url)) continue;
+    const norm = normalizeWebUrl(url);
+    if (seen.has(norm)) continue;
+    seen.add(norm);
+    out.push({
+      name: name.slice(0, 90), url,
+      description: String(e.description || "").trim().slice(0, 300),
+    });
+    if (out.length >= cap) break;
+  }
+  return out;
+}
+
+async function parallelEntitySearch(objective: string, key: string): Promise<any> {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), PARALLEL_ENTITY_TIMEOUT_MS);
+  try {
+    const r = await fetch(PARALLEL_ENTITY_API, {
+      method: "POST",
+      signal: ctrl.signal,
+      headers: {
+        "Content-Type": "application/json",
+        "User-Agent": UA,
+        "x-api-key": key,
+      },
+      body: JSON.stringify({
+        entity_type: "companies",
+        objective,
+        match_limit: PARALLEL_ENTITY_LIMIT,
+      }),
+    });
+    if (r.status === 401)
+      throw new Error("parallel-entities: invalid API key (HTTP 401) — check PARALLEL_API_KEY on the Keys screen");
+    if (r.status === 402)
+      throw new Error("parallel-entities: quota exhausted (HTTP 402) — check usage at platform.parallel.ai");
+    if (r.status === 429)
+      throw new Error("parallel-entities: rate-limited (HTTP 429) — paused for this run");
+    if (!r.ok) throw new Error(`HTTP ${r.status} from api.parallel.ai/v1beta/findall`);
+    return await r.json();
+  } finally { clearTimeout(t); }
+}
+
+export function parallelEntitiesObjective(ctx: Ctx): string {
+  const place = ctx.country ? `${ctx.city}, ${ctx.country}` : ctx.city;
+  return `Companies headquartered or with significant operations in ${place} — ` +
+    `established businesses with a public web presence.`;
+}
+
+export async function collectParallelEntities(ctx: Ctx): Promise<SourceResult> {
+  const key = resolveKey("PARALLEL_API_KEY");
+  if (!key) {
+    return {
+      nodes: [], edges: [],
+      note: "idle — add a Parallel API key on the Keys screen (top bar) to activate",
+    };
+  }
+  const objective = parallelEntitiesObjective(ctx);
+  const j = await parallelEntitySearch(objective, key);
+  const nodes: GNode[] = [], edges: GEdge[] = [];
+  for (const e of parseParallelEntities(j)) {
+    const id = `parallelent:${slug(e.url || e.name)}`;
+    nodes.push({
+      id, label: e.name, type: "org" as NodeType, subtype: "company",
+      source: "parallel-entities", detail: e.description, url: e.url,
+    });
+    edges.push({ from: ctx.cityId, to: id, label: "company" });
+  }
+  return {
+    nodes, edges,
+    note: `${nodes.length} companies discovered in ${ctx.city} via Parallel FindAll`,
+  };
+}
+
 // ---------- source registry ----------
 // `business` classifies each collector for business-only recon runs
 // (e.g. runs initiated from Milton): true ONLY when the collector emits
@@ -2517,6 +2622,7 @@ export const SOURCE_DEFS = [
   { key: "enhetsregisteret", label: "Norwegian entities · Enhetsregisteret", business: true }, // NO entity registry
   { key: "exa", label: "Web search · Exa", business: false },                   // keyword web search — mixed payloads incl. people/news
   { key: "parallel", label: "Web search · Parallel", business: false },         // LLM-excerpt web search — mixed payloads incl. people/news
+  { key: "parallel-entities", label: "Companies · Parallel FindAll", business: true }, // entity-search, companies only
   { key: "enrich", label: "Enrichment · company principals", business: false },  // emits executive person nodes
 ];
 

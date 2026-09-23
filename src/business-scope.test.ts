@@ -42,6 +42,7 @@ test("SOURCE_DEFS keys are unique", () => {
 const EXPECTED_BUSINESS = [
   "overpass", "business", "gleif", "nonprofits", "fdic",
   "gleifname", "secedgar", "wikidataorg", "hkcr", "enhetsregisteret",
+  "parallel-entities",
 ];
 
 test("business allowlist is exactly the audited set", () => {

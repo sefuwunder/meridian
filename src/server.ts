@@ -25,7 +25,7 @@ import {
   collectInternetdb, collectAdsblol, collectEonet, collectUsgs,
   collectHackertarget, collectMnemonic, collectCertspotter, collectBrasilapi,
   collectGleifName, collectSecEdgar, collectWikidataOrg,
-  collectHkcr, collectEnhetsregisteret, collectExa, collectParallel, collectEnrich,
+  collectHkcr, collectEnhetsregisteret, collectExa, collectParallel, collectParallelEntities, collectEnrich,
   probeKeySource,
   type Ctx, type GNode, type GEdge, type SourceResult,
 } from "./sources";
@@ -85,6 +85,7 @@ const COLLECTORS: Record<string, (ctx: Ctx) => Promise<SourceResult>> = {
   enhetsregisteret: collectEnhetsregisteret,
   exa: collectExa,
   parallel: collectParallel,
+  "parallel-entities": collectParallelEntities,
   enrich: collectEnrich,
 };
 
