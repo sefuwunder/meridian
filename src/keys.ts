@@ -58,7 +58,7 @@ export const KEY_DEFS: KeyDef[] = [
     id: "PARALLEL_API_KEY",
     name: "Parallel",
     required: true,
-    benefit: "activates the Parallel web-search source (natural-language web search with LLM-optimized excerpts) and the Parallel FindAll company-discovery source",
+    benefit: "activates the Parallel web-search source (natural-language web search with LLM-optimized excerpts), the Parallel FindAll company-discovery source in recon runs, and FindAll company enrichment in territory prospecting",
     signup: "https://platform.parallel.ai",
     signupLabel: "API key at platform.parallel.ai",
   },

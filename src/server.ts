@@ -223,8 +223,8 @@ export async function runProspectJob(id: string, location: string, industry: str
   const setProgress = (done: number, total: number, current: string) =>
     updateProspectJob(id, { progress_json: JSON.stringify({ done, total, current }) });
   try {
-    setProgress(0, 3, "geocoding");
-    const { companies, nodes, edges } = await runProspect(location, industry, {
+    setProgress(0, 4, "geocoding");
+    const { companies, nodes, edges, warnings } = await runProspect(location, industry, {
       progress: (d, t, c) => setProgress(d, t, c),
       // the territory node (and later the companies) stream into the store
       // as they arrive, so a job that dies downstream still shows something
@@ -234,8 +234,8 @@ export async function runProspectJob(id: string, location: string, industry: str
     });
     updateProspectJob(id, {
       status: "done",
-      progress_json: JSON.stringify({ done: 3, total: 3, current: "" }),
-      result_json: JSON.stringify({ companies }),
+      progress_json: JSON.stringify({ done: 4, total: 4, current: "" }),
+      result_json: JSON.stringify({ companies, warnings }),
       nodes_json: JSON.stringify(nodes),
       edges_json: JSON.stringify(edges),
     });

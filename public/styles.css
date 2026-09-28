@@ -207,3 +207,4 @@ button.linklike{background:none; border:none; padding:0; color:var(--acc2); font
 button.linklike:hover{text-decoration:underline; box-shadow:none; transform:none}
 .btnrow{display:flex; gap:8px; margin-top:10px}
 .btnrow button{flex:1}
+.prospect-hint{color:var(--mut); font-size:11px; opacity:.75; margin:2px 0 8px}

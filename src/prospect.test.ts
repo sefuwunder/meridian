@@ -1,4 +1,4 @@
-// meridian — tests for territory prospecting (39) and the /api/prospect job
+// meridian — tests for territory prospecting (30) and the /api/prospect job
 // machinery. All network is stubbed; nothing here touches the real web.
 // The suite shares the dev API server with enrich.test.ts on scratch port
 // 45691: whichever file's dynamic server import runs first binds it, and
@@ -8,6 +8,7 @@ import { test, expect, beforeAll, afterEach } from "bun:test";
 import {
   INDUSTRY_TAGS, matchIndustry, singularish, escapeRegex, formatAddress,
   buildOverpassQuery, geocodeLocation, runProspect, PROSPECT_UA,
+  buildFindallObjective, parseFindallEntities, runFindallStep,
 } from "./prospect";
 import {
   createProspectJob, getProspectJob, listProspectJobs, updateProspectJob, fullProspectJob,
@@ -253,6 +254,125 @@ test("runProspect caps companies at 100", async () => {
   expect(r.nodes.filter((n) => n.subtype === "prospect").length).toBe(100);
 });
 
+// ---------- Parallel FindAll business-entity search ----------
+
+const FINDALL_JSON = {
+  entities: [
+    { name: "Queen City Dental Studio", url: "https://queencitydental.example.com", description: "Family dental practice in Madisonville." },
+    { name: "Bright Smile Dental", url: "https://brightsmile.example.com", description: "dup of the Overpass hit — merged away" },
+    { name: "", url: "https://noname.example.com", description: "nameless — dropped" },
+    { name: "No Site Dental", url: "not-a-url", description: "bad URL tolerated, url cleared" },
+    { name: "Queen City Dental Studio", url: "https://queencitydental.example.com", description: "exact dup — dropped" },
+  ],
+};
+
+function findallStub(url: string, init?: RequestInit): Promise<Response> {
+  const u = String(url);
+  if (u.includes("api.parallel.ai")) return Promise.resolve(jsonResponse(FINDALL_JSON));
+  return stubFetch(url, init);
+}
+
+afterEach(() => { delete process.env.PARALLEL_API_KEY; });
+
+test("buildFindallObjective anchors industry and location", () => {
+  const o = buildFindallObjective("dental clinics", "Madisonville, Cincinnati");
+  expect(o).toContain("dental clinics");
+  expect(o).toContain("Madisonville, Cincinnati");
+});
+
+test("parseFindallEntities drops nameless/dup entities and clears bad URLs", () => {
+  const ents = parseFindallEntities(FINDALL_JSON);
+  expect(ents.map((e) => e.name)).toEqual([
+    "Queen City Dental Studio", "Bright Smile Dental", "No Site Dental",
+  ]);
+  expect(ents[0].url).toBe("https://queencitydental.example.com");
+  expect(ents[0].description).toContain("Family dental practice");
+  expect(ents[2].url).toBe("");
+});
+
+test("parseFindallEntities caps at match_limit", () => {
+  const many = { entities: Array.from({ length: 40 }, (_, i) => ({ name: `Co ${i}`, url: `https://co${i}.example.com` })) };
+  expect(parseFindallEntities(many).length).toBe(25);
+  expect(parseFindallEntities({})).toEqual([]);
+});
+
+test("runFindallStep without a key skips silently and never fetches", async () => {
+  let fetched = false;
+  const r = await runFindallStep("dental", "Madisonville", "terr", "Madisonville, Cincinnati",
+    new Set(), (() => { fetched = true; return Promise.reject(new Error("nope")); }) as any);
+  expect(fetched).toBe(false);
+  expect(r.companies).toEqual([]);
+  expect(r.warnings).toEqual([]);
+});
+
+test("runFindallStep posts entity-search with x-api-key and merges company nodes", async () => {
+  process.env.PARALLEL_API_KEY = "pk-test";
+  let sentUrl = "", sentHeaders: any = {}, sentBody: any = {};
+  const spy = (url: string, init?: RequestInit) => {
+    sentUrl = String(url);
+    sentHeaders = (init as any)?.headers || {};
+    sentBody = JSON.parse(String((init as any)?.body || "{}"));
+    return findallStub(url, init);
+  };
+  const r = await runFindallStep("dental", "Madisonville", "terr:1", "Madisonville, Cincinnati",
+    new Set(["brightsmiledental"]), spy as any);
+  expect(sentUrl).toContain("api.parallel.ai/v1beta/findall/entity-search");
+  expect(sentHeaders["x-api-key"]).toBe("pk-test");
+  expect(sentBody.entity_type).toBe("companies");
+  expect(sentBody.match_limit).toBe(25);
+  expect(sentBody.objective).toContain("dental");
+  // Bright Smile Dental deduped against the Overpass set; nameless dropped
+  expect(r.companies.map((c) => c.name)).toEqual(["Queen City Dental Studio", "No Site Dental"]);
+  const c0 = r.companies[0];
+  expect(c0.source).toBe("findall");
+  expect(c0.prospect).toBe(true);
+  expect(c0.industry).toBe("dental");
+  expect(c0.territory).toBe("Madisonville, Cincinnati");
+  expect(c0.url).toBe("https://queencitydental.example.com");
+  const n0 = r.nodes[0];
+  expect(n0.id).toBe("prospect:findall:queen-city-dental-studio-0");
+  expect(n0.type).toBe("org");
+  expect(n0.subtype).toBe("prospect");
+  expect(n0.source).toBe("findall");
+  expect(r.edges[0]).toEqual({ from: n0.id, to: "terr:1", label: "located in" });
+  expect(r.warnings).toEqual([]);
+});
+
+test("runFindallStep degrades to a warning on API failure instead of throwing", async () => {
+  process.env.PARALLEL_API_KEY = "pk-test";
+  const bad = () => Promise.resolve(new Response("boom", { status: 500 }));
+  const r = await runFindallStep("dental", "Madisonville", "terr:1", "Madisonville, Cincinnati",
+    new Set(), bad as any);
+  expect(r.companies).toEqual([]);
+  expect(r.warnings.length).toBe(1);
+  expect(r.warnings[0]).toContain("findall HTTP 500");
+});
+
+test("runProspect merges FindAll companies after Overpass when a key is set", async () => {
+  process.env.PARALLEL_API_KEY = "pk-test";
+  const steps: [number, number, string][] = [];
+  const r = await runProspect("Madisonville, Cincinnati", "dental", {
+    fetchImpl: findallStub as any,
+    progress: (d, t, c) => steps.push([d, t, c]),
+  });
+  // 2 Overpass (Bright Smile, Gentle Care) + 2 FindAll
+  // (Queen City, No Site; Bright Smile dup merged away)
+  expect(r.companies.length).toBe(4);
+  expect(r.companies.map((c) => c.source)).toEqual(["overpass", "overpass", "findall", "findall"]);
+  expect(r.companies[2].name).toBe("Queen City Dental Studio");
+  expect(r.companies[3].name).toBe("No Site Dental");
+  expect(r.warnings).toEqual([]);
+  expect(steps.map((s) => s[2])).toContain("querying findall");
+  expect(steps.every((s) => s[1] === 4)).toBe(true);
+  expect(steps[steps.length - 1]).toEqual([4, 4, ""]);
+});
+
+test("runProspect without a key keeps Overpass results and reports no warnings", async () => {
+  const r = await runProspect("Madisonville, Cincinnati", "dental", { fetchImpl: stubFetch as any });
+  expect(r.companies.length).toBe(2);
+  expect(r.warnings).toEqual([]);
+});
+
 // ---------- db ----------
 
 test("prospect job db: create -> update -> full shape -> list", () => {
@@ -340,7 +460,7 @@ test("POST /api/prospect runs running -> done with companies and graph", async (
 
   const done = await pollProspectJob(created.job_id, ["done", "failed", "partial"]);
   expect(done.status).toBe("done");
-  expect(done.progress.done).toBe(3);
+  expect(done.progress.done).toBe(4);
   expect(done.companies.length).toBe(2);
   const c0 = done.companies[0];
   expect(c0.name).toBe("Bright Smile Dental");
