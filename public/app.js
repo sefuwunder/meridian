@@ -338,11 +338,44 @@ function selectNode(id) {
 /* ================= views ================= */
 function showView(v) {
   S.view = v;
-  document.querySelector("aside.left").style.display = v === "graph" ? "" : "";
-  document.querySelector("main.stage").style.display = v === "graph" ? "" : "none";
-  document.querySelector("aside.right").style.display = v === "graph" ? "" : "none";
-  document.querySelector("aside.left").style.display = v === "graph" ? "" : "none";
-  if (v === "graph") { resize(); }
+  const graph = v === "graph";
+  document.querySelector("aside.left").style.display = graph ? "" : "none";
+  document.querySelector("aside.right").style.display = graph ? "" : "none";
+  $("welcome").hidden = graph;
+  for (const id of ["graph", "searchInput", "typeChips", "graphCounts"]) {
+    const el = $(id);
+    if (el) el.style.display = graph ? "" : "none";
+  }
+  const hint = document.querySelector("main.stage .hint");
+  if (hint) hint.style.display = graph ? "" : "none";
+  if (graph) { resize(); }
+  else { renderWelcome(); }
+}
+
+/** List view: centered start card with the seed form + investigation grid. */
+function renderWelcome() {
+  fillTypeSelect($("wType"), true);
+  const box = $("welcomeList");
+  if (!S.invList.length) {
+    box.innerHTML = '<div class="empty">no investigations yet — open your first above</div>';
+    return;
+  }
+  box.innerHTML = S.invList.map((i) =>
+    `<button class="wcard" data-id="${escapeHtml(i.id)}">` +
+    `<span class="wname">${escapeHtml(i.name)}</span>` +
+    `<span class="wmeta">${i.entities} entities · ${i.links} links</span></button>`
+  ).join("");
+  box.querySelectorAll(".wcard").forEach((c) => {
+    c.addEventListener("click", () => openInvestigation(c.dataset.id));
+  });
+}
+
+async function createInvestigation(name, seedValue, seedType) {
+  const j = await api("/api/investigations", {
+    method: "POST",
+    body: JSON.stringify({ name, seedValue, seedType: seedType || undefined }),
+  });
+  return j.investigation.id;
 }
 
 async function loadInvList() {
@@ -376,6 +409,7 @@ async function loadInvList() {
       loadInvList();
     });
   });
+  if (S.view === "list") renderWelcome();
 }
 
 async function openInvestigation(id) {
@@ -546,15 +580,24 @@ async function setupModals() {
     const seed = $("seedInput").value.trim();
     if (!seed) { toast("enter a seed entity first", 3000); return; }
     try {
-      const j = await api("/api/investigations", {
-        method: "POST",
-        body: JSON.stringify({ name, seedValue: seed, seedType: $("seedType").value || undefined }),
-      });
+      const id = await createInvestigation(name, seed, $("seedType").value);
       $("invName").value = ""; $("seedInput").value = "";
-      openInvestigation(j.investigation.id);
+      openInvestigation(id);
     } catch (e) { toast("couldn't open investigation: " + e.message, 5000); }
   });
   $("seedInput").addEventListener("keydown", (ev) => { if (ev.key === "Enter") $("btnNewInv").click(); });
+
+  async function openFromWelcome() {
+    const name = $("wName").value.trim() || "untitled";
+    const seed = $("wSeed").value.trim();
+    if (!seed) { toast("enter a seed entity first", 3000); return; }
+    try {
+      const id = await createInvestigation(name, seed, $("wType").value);
+      openInvestigation(id);
+    } catch (e) { toast("couldn't open investigation: " + e.message, 5000); }
+  }
+  $("wOpen").addEventListener("click", openFromWelcome);
+  $("wSeed").addEventListener("keydown", (ev) => { if (ev.key === "Enter") openFromWelcome(); });
 
   $("btnAddEntity").addEventListener("click", () => {
     if (!S.inv) { toast("open an investigation first", 3000); return; }
@@ -675,6 +718,6 @@ document.addEventListener("DOMContentLoaded", boot);
 // test seam (evaluated by the DOM test suite with a stubbed document)
 (globalThis).__meridian = {
   S, selectNode, renderDetail, renderChips, loadInvList, refreshKeys,
-  fillTypeSelect, transformsForEntity, syncGraph, applyFilters,
+  fillTypeSelect, transformsForEntity, syncGraph, applyFilters, renderWelcome,
 };
 })();

@@ -43,6 +43,23 @@
 </aside>
 
 <main class="stage">
+  <div class="welcome" id="welcome" hidden>
+    <div class="welcome-card">
+      <div class="welcome-brand"><span class="mark">◈</span> meridian</div>
+      <p class="welcome-tag">link analysis — start from any entity, run transforms, grow the graph.</p>
+      <div class="welcome-form">
+        <input id="wName" placeholder="investigation name — e.g. acme-corp" autocomplete="off">
+        <input id="wSeed" placeholder="seed — domain, IP, company, person…" autocomplete="off">
+        <div class="row">
+          <select id="wType" title="entity type (auto-detected)">
+            <option value="">auto-detect</option>
+          </select>
+          <button id="wOpen" class="primary">open investigation</button>
+        </div>
+      </div>
+      <div class="welcome-list" id="welcomeList"></div>
+    </div>
+  </div>
   <canvas id="graph"></canvas>
   <div class="stage-top">
     <input id="searchInput" placeholder="⌕ search entities across sources…" autocomplete="off">

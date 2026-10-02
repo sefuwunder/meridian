@@ -644,3 +644,45 @@ test("investigation list shows the empty state", async () => {
     delete g.__meridian;
   }
 });
+
+test("welcome view renders the start card and investigation grid", async () => {
+  const byId = new Map<string, any>();
+  const qmap = new Map<string, any>();
+  const docStub: any = {
+    readyState: "loading",
+    getElementById: (id: string) => {
+      if (!byId.has(id)) byId.set(id, makeEl("div"));
+      return byId.get(id);
+    },
+    createElement: (t: string) => makeEl(t),
+    querySelector: (s: string) => {
+      if (!qmap.has(s)) qmap.set(s, makeEl("div"));
+      return qmap.get(s);
+    },
+    querySelectorAll: () => [],
+    addEventListener() {},
+  };
+  const g: any = globalThis;
+  const prevDoc = g.document, prevWin = g.window, prevFetch = g.fetch;
+  g.document = docStub;
+  g.window = g;
+  g.fetch = async () => ({ ok: true, json: async () => ({}) });
+  try {
+    const src = readFileSync(new URL("../public/app.js", import.meta.url).pathname, "utf8");
+    (0, eval)(src);
+    const M = g.__meridian;
+    M.S.types = { domain: { label: "Domain", icon: "🌐", color: "#4A90D9" } };
+    M.S.invList = [
+      { id: "inv-aaa", name: "acme-corp", entities: 12, links: 18 },
+    ];
+    M.renderWelcome();
+    // type select filled on the welcome form
+    expect(byId.get("wType")._html).toContain('value="domain"');
+    // investigation card rendered
+    expect(byId.get("welcomeList")._html).toContain("acme-corp");
+    expect(byId.get("welcomeList")._html).toContain("12 entities");
+  } finally {
+    g.document = prevDoc; g.window = prevWin; g.fetch = prevFetch;
+    delete g.__meridian;
+  }
+});
