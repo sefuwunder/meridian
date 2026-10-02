@@ -205,3 +205,60 @@ export function fullEnrichJob(row: EnrichJobRow): any {
     created_at: row.created_at, updated_at: row.updated_at,
   };
 }
+
+// ---------- investigations (Maltego-style entity graphs) ----------
+// An investigation is a graph of typed entities + labeled links, grown by
+// running transforms. Replaces the city-recon model in the UI.
+
+db.exec(`
+CREATE TABLE IF NOT EXISTS investigations (
+  id TEXT PRIMARY KEY,
+  name TEXT NOT NULL,
+  entities_json TEXT NOT NULL DEFAULT '[]',
+  links_json TEXT NOT NULL DEFAULT '[]',
+  created_at INTEGER NOT NULL,
+  updated_at INTEGER NOT NULL
+);`);
+
+export interface InvestigationRow {
+  id: string; name: string;
+  entities_json: string; links_json: string;
+  created_at: number; updated_at: number;
+}
+
+export function createInvestigation(id: string, name: string, entities: any[]): void {
+  db.query(
+    `INSERT INTO investigations (id, name, entities_json, links_json, created_at, updated_at)
+     VALUES (?, ?, ?, '[]', ?, ?)`
+  ).run(id, name, JSON.stringify(entities), now(), now());
+}
+
+export function getInvestigation(id: string): InvestigationRow | null {
+  return db.query(`SELECT * FROM investigations WHERE id = ?`).get(id) as InvestigationRow | null;
+}
+
+export function listInvestigations(): any[] {
+  return db.query(
+    `SELECT id, name, created_at, updated_at,
+            json_array_length(entities_json) AS entities, json_array_length(links_json) AS links
+     FROM investigations ORDER BY updated_at DESC LIMIT 50`
+  ).all();
+}
+
+export function updateInvestigation(id: string, entities: any[], links: any[]): void {
+  db.query(`UPDATE investigations SET entities_json = ?, links_json = ?, updated_at = ? WHERE id = ?`)
+    .run(JSON.stringify(entities), JSON.stringify(links), now(), id);
+}
+
+export function deleteInvestigation(id: string): void {
+  db.query(`DELETE FROM investigations WHERE id = ?`).run(id);
+}
+
+export function fullInvestigation(row: InvestigationRow): any {
+  return {
+    id: row.id, name: row.name,
+    entities: JSON.parse(row.entities_json || "[]"),
+    links: JSON.parse(row.links_json || "[]"),
+    created_at: row.created_at, updated_at: row.updated_at,
+  };
+}

@@ -1,16 +1,20 @@
-# meridian — graph OSINT recon
+# meridian — link analysis
 
-Land in a foreign city, launch a recon sprint, and watch social, cultural, and
-business intel assemble itself into an interactive web of connected nodes.
+Start from any entity — a domain, an IP, a company name, a person — and grow
+an investigation graph by running **transforms**. Each transform takes one
+entity and fans out into new entities connected by labeled links, Maltego-style.
 
-`meridian` collects from **thirty-eight free, keyless sources** plus five optional
-keyed ones (OCCRP Aleph, WiGLE, Exa and Parallel need API credentials to activate;
-OpenFEC works out of the box on a low demo quota and accepts a free personal
-key for the full rate). It lays the results out as a force-directed node graph: the city
-sits pinned at the hub, everything else — restaurants, museums, coworking
-spaces, embassies, hospitals, companies, legal entities, notable people,
-researchers, artists, headlines, live aircraft, currency, weather, local
-time — orbits it, connected by labeled edges.
+`meridian` ships **13 transforms** over free and keyless sources (Shodan
+InternetDB, Cert Spotter, mnemonic passive DNS, IPQuery, urlscan.io, GLEIF,
+SEC EDGAR, OpenAlex, OpenFEC, OpenStreetMap, adsb.lol) plus two keyed ones
+(Exa web search, Parallel FindAll — keys on the Keys screen, never committed).
+A unified **entity search** sits in the top bar: type anything, the type is
+auto-detected (IP, email, phone, URL, domain…), and results drop straight onto
+the graph. Everything persists in SQLite; investigations export as JSON.
+
+The 38 city-recon collectors from meridian 1.x live on in `src/sources.ts` —
+the transform layer (`src/transforms.ts`) re-scopes the most entity-natural
+ones from "everything about a city" to "everything about this entity".
 
 ## Run it
 
@@ -33,9 +37,54 @@ EXA_API_KEY=...               # free key at dashboard.exa.ai — activates the E
 PARALLEL_API_KEY=...               # free key at dashboard.exa.ai — activates the Exa web-search source
 ```
 
-Type a city, tick the sources you want, hit **launch recon**. Collection runs in
-the background; the graph fills in live as each source lands. A sprint clock in
-the header tracks elapsed time.
+Type a seed — `example.com`, `8.8.8.8`, `Acme Corp`, `Marie Curie` — pick the
+entity type (or let it auto-detect) and hit **open**. Click any entity to see
+its detail and the transforms that accept it; run one and the new entities
+animate into the graph. The top-bar search queries GLEIF / OpenAlex / the raw
+value across sources without leaving the canvas.
+
+## Entities
+
+Twelve types, each with its own icon and color: domain 🌐, IP 🖧, person 👤,
+company 🏢, email ✉️, phone 📞, location 📍, URL 🔗, netblock 🕸️, AS 🛣️,
+document 📄, analyst note 📝. Entity ids are deterministic
+(`domain:example-com`), so re-running a transform never duplicates nodes.
+
+## Transforms
+
+| key | inputs | what it does |
+|---|---|---|
+| `cert-subdomains` | domain | subdomains from certificate-transparency logs |
+| `dns-history` | domain | passive DNS: IPs it resolved to, CNAME targets |
+| `domain-scans` | domain | recent urlscan.io scans + hosting IPs |
+| `ip-ports` | ip | open ports, hostnames, CVEs (Shodan InternetDB) |
+| `ip-intel` | ip | ISP/ASN/geo/risk (IPQuery) |
+| `company-gleif` | company | LEI registry matches + parent companies |
+| `company-findall` | company 🔑 | AI company profile (Parallel) |
+| `company-sec` | company | SEC EDGAR filer match |
+| `person-papers` | person | OpenAlex author match + papers |
+| `person-donations` | person | campaign-finance recipients (OpenFEC) |
+| `location-places` | location | nearby businesses (OpenStreetMap) |
+| `location-aircraft` | location | live aircraft overhead (ADS-B) |
+| `web-search` | most 🔑 | neural web search (Exa) |
+
+🔑 = needs a key on the Keys screen. Every transform is best-effort: one dead
+source reports a note instead of failing the run.
+
+## API
+
+```
+POST /api/investigations            {name, seedValue, seedType?} → investigation
+GET  /api/investigations            list
+GET  /api/investigations/:id        full graph
+POST /api/investigations/:id/entities   {type?, value} → add entity
+POST /api/investigations/:id/transform {entityId, transformKey} → run, merge
+POST /api/investigations/:id/note      {text, entityId?} → analyst note
+DELETE /api/investigations/:id
+POST /api/search                    {query, type?} → entity candidates
+GET  /api/entity-types              the 12 types with icons/colors
+GET  /api/transforms                registry (key/label/description/inputs)
+```
 
 ## Sources
 

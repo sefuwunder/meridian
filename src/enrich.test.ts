@@ -257,7 +257,9 @@ test("collectEnrich idles with no stashed domains", async () => {
   expect(r.note).toContain("no company keywords");
 });
 
-// ---------- launch-form checkbox (DOM-stubbed) ----------
+// ---------- seed-type select (DOM-stubbed) ----------
+// The pivot replaced the recon launch form: the "new investigation" form now
+// offers an entity-type dropdown driven by /api/entity-types.
 
 function makeEl(tag: string): any {
   const el: any = {
@@ -289,7 +291,7 @@ function makeEl(tag: string): any {
   return el;
 }
 
-test("launch form renders an enrich checkbox from /api/source-defs", async () => {
+test("seed-type select renders entity types from /api/entity-types", async () => {
   const byId = new Map<string, any>();
   const docStub: any = {
     readyState: "loading", // boot() stays parked; we call the seam directly
@@ -305,20 +307,20 @@ test("launch form renders an enrich checkbox from /api/source-defs", async () =>
   const prevDoc = g.document, prevWin = g.window, prevFetch = g.fetch;
   g.document = docStub;
   g.window = g;
-  g.fetch = async (url: string) => jsonResponse({
-    sources: [
-      { key: "geocode", label: "Geocode · OpenStreetMap" },
-      { key: "enrich", label: "Enrichment · company principals" },
-    ],
-  });
+  g.fetch = async () => ({ ok: true, json: async () => ({}) });
   try {
     const src = readFileSync(new URL("../public/app.js", import.meta.url).pathname, "utf8");
     (0, eval)(src);
-    await g.__meridian.renderSourceChecks();
-    const box = byId.get("sourceChecks");
-    const labels: string[] = box.children.map((c: any) => c._html);
-    expect(labels.some((h) => h.includes('value="enrich"'))).toBe(true);
-    expect(labels.some((h) => h.includes('value="geocode"'))).toBe(true);
+    g.__meridian.S.types = {
+      domain: { label: "Domain", icon: "🌐", color: "#4A90D9" },
+      ip: { label: "IP address", icon: "🖧", color: "#7B61FF" },
+    };
+    const sel = makeEl("select");
+    g.__meridian.fillTypeSelect(sel, true);
+    expect(sel._html).toContain('<option value="">auto-detect</option>');
+    expect(sel._html).toContain('value="domain"');
+    expect(sel._html).toContain('value="ip"');
+    expect(sel._html).toContain("🌐 Domain");
   } finally {
     g.document = prevDoc; g.window = prevWin; g.fetch = prevFetch;
     delete g.__meridian;

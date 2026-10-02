@@ -540,7 +540,9 @@ test("lifecycle cleanup", async () => {
   expect(lifecycleJobIds.length).toBe(3);
 });
 
-// ---------- prospect panel UI (DOM-stubbed) ----------
+// ---------- investigation list UI (DOM-stubbed) ----------
+// The pivot replaced the territory-prospecting panel: the sidebar now lists
+// investigations, rendered by loadInvList() from /api/investigations.
 
 function makeEl(tag: string): any {
   const el: any = {
@@ -576,7 +578,7 @@ function makeEl(tag: string): any {
   return el;
 }
 
-test("prospect panel lists jobs with status pills", async () => {
+test("investigation list renders rows with entity/link counts", async () => {
   const byId = new Map<string, any>();
   const docStub: any = {
     readyState: "loading",
@@ -592,39 +594,51 @@ test("prospect panel lists jobs with status pills", async () => {
   const prevDoc = g.document, prevWin = g.window, prevFetch = g.fetch;
   g.document = docStub;
   g.window = g;
-  g.fetch = async (url: string) => {
-    if (String(url).includes("/api/prospect/p1"))
-      return jsonResponse({
-        id: "p1", location: "Madisonville, Cincinnati", industry: "dental",
-        status: "done", progress: { done: 3, total: 3, current: "" }, error: null,
-        companies: [{ name: "Bright Smile Dental" }],
-        nodes: [{ id: "prospect:territory:madisonville", label: "Madisonville, Cincinnati", type: "place" }],
-        edges: [], created_at: 1, updated_at: 2,
-      });
-    return jsonResponse({
-      jobs: [
-        { id: "p1", location: "Madisonville, Cincinnati", industry: "dental", status: "done", company_count: 2, created_at: 1, updated_at: 2 },
-        { id: "p2", location: "Nowhere Xyzzy", industry: "dental", status: "running", company_count: 0, created_at: 1, updated_at: 2 },
+  g.fetch = async (url: string) => ({
+    ok: true,
+    json: async () => ({
+      investigations: [
+        { id: "inv-aaa", name: "acme-corp", entities: 12, links: 18, created_at: 1, updated_at: 2 },
+        { id: "inv-bbb", name: "empty", entities: 1, links: 0, created_at: 1, updated_at: 1 },
       ],
-    });
-  };
+    }),
+  });
   try {
     const src = readFileSync(new URL("../public/app.js", import.meta.url).pathname, "utf8");
     (0, eval)(src);
-    await g.__meridian.loadProspectList();
-    const box = byId.get("prospectList");
-    expect(box.children.length).toBe(2);
-    const t0 = box.children[0].querySelector(".t span").textContent;
-    expect(t0).toBe("dental · Madisonville, Cincinnati");
-    expect(box.children[0].querySelector(".m").textContent).toContain("2 companies");
-    const t1 = box.children[1].querySelector(".t span").textContent;
-    expect(t1).toBe("dental · Nowhere Xyzzy");
+    await g.__meridian.loadInvList();
+    const html: string = byId.get("invList")._html;
+    expect(html).toContain("acme-corp");
+    expect(html).toContain("12 entities · 18 links");
+    expect(html).toContain("inv-bbb");
+  } finally {
+    g.document = prevDoc; g.window = prevWin; g.fetch = prevFetch;
+    delete g.__meridian;
+  }
+});
 
-    // clicking a finished job loads its graph into the canvas model
-    box.children[0].onclick();
-    await new Promise((r) => setTimeout(r, 50));
-    expect(g.__meridian.S.recon.id).toBe("prospect:p1");
-    expect(g.__meridian.S.recon.nodes.length).toBe(1);
+test("investigation list shows the empty state", async () => {
+  const byId = new Map<string, any>();
+  const docStub: any = {
+    readyState: "loading",
+    getElementById: (id: string) => {
+      if (!byId.has(id)) byId.set(id, makeEl("div"));
+      return byId.get(id);
+    },
+    createElement: (t: string) => makeEl(t),
+    querySelectorAll: () => [],
+    addEventListener() {},
+  };
+  const g: any = globalThis;
+  const prevDoc = g.document, prevWin = g.window, prevFetch = g.fetch;
+  g.document = docStub;
+  g.window = g;
+  g.fetch = async () => ({ ok: true, json: async () => ({ investigations: [] }) });
+  try {
+    const src = readFileSync(new URL("../public/app.js", import.meta.url).pathname, "utf8");
+    (0, eval)(src);
+    await g.__meridian.loadInvList();
+    expect(byId.get("invList")._html).toContain("no investigations yet");
   } finally {
     g.document = prevDoc; g.window = prevWin; g.fetch = prevFetch;
     delete g.__meridian;

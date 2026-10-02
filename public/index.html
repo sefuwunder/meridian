@@ -3,8 +3,8 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>meridian — graph OSINT recon</title>
-    <link rel="icon" type="image/svg+xml" href="/favicon.svg">
+<title>meridian — link analysis</title>
+<link rel="icon" type="image/svg+xml" href="/favicon.svg">
 <link rel="stylesheet" href="/styles.css">
 </head>
 <body>
@@ -12,89 +12,74 @@
 
 <header class="topbar">
   <div class="brand"><span class="mark">◈</span> meridian</div>
-  <div class="recon-title" id="reconTitle">no recon loaded</div>
-  <div class="clock" id="sprintClock" title="time since this recon started">--:--:--</div>
+  <div class="inv-title" id="invTitle">no investigation open</div>
   <div class="top-actions">
     <button id="btnFit" title="fit graph to view">fit</button>
     <button id="btnPause" title="pause / resume the layout">pause</button>
-    <button id="btnNote" title="add an analyst note node">+ note</button>
-    <button id="btnExport" title="download recon as JSON">export</button>
-    <button id="btnCsv" title="download nodes as CSV">csv</button>
-    <button id="btnCases" title="save / open / merge case files">cases</button>
+    <button id="btnAddEntity" title="add an entity manually">+ entity</button>
+    <button id="btnNote" title="add an analyst note">+ note</button>
+    <button id="btnExport" title="download investigation as JSON">export</button>
     <button id="btnKeys" title="manage API keys">keys</button>
   </div>
 </header>
 
 <aside class="left">
   <section class="panel">
-    <h3>new recon sprint</h3>
-    <input id="cityInput" placeholder="city — e.g. Dakar, Senegal" autocomplete="off">
-    <div class="sources-check" id="sourceChecks"></div>
-    <div class="scope-toggle" role="radiogroup" aria-label="recon scope">
-      <label><input type="radio" name="reconScope" value="full" checked> full recon</label>
-      <label><input type="radio" name="reconScope" value="business"> business data only</label>
+    <h3>new investigation</h3>
+    <input id="invName" placeholder="name — e.g. acme-corp" autocomplete="off">
+    <input id="seedInput" placeholder="seed — domain, IP, company, person…" autocomplete="off">
+    <div class="row">
+      <select id="seedType" title="entity type (auto-detected)">
+        <option value="">auto-detect</option>
+      </select>
+      <button id="btnNewInv" class="primary">open</button>
     </div>
-    <button id="btnLaunch" class="primary">launch recon</button>
-    <p class="fine">nineteen keyless sources plus two keyed-free ones. failures are contained — one dead source never kills the sprint.</p>
-  </section>
-  <section class="panel" id="collectPanel" hidden>
-    <h3>collection</h3>
-    <div class="progress"><div id="progressBar"></div></div>
-    <div id="progressLabel" class="fine"></div>
-    <ul class="sources" id="sourceList"></ul>
+    <p class="fine">start from any entity — a domain, an IP, a company name, a person. run transforms to grow the graph.</p>
   </section>
   <section class="panel grow">
-    <h3>recons</h3>
-    <ul class="recons" id="reconList"></ul>
-  </section>
-  <section class="panel" id="prospectPanel">
-    <h3>territory prospecting</h3>
-    <input id="prospectLocation" placeholder="territory — e.g. Madisonville, Cincinnati" autocomplete="off">
-    <input id="prospectIndustry" placeholder="industry — e.g. dental" autocomplete="off">
-    <button id="btnProspectStart" class="primary">find companies</button>
-    <div class="prospect-hint">open map data via Overpass; a Parallel key on the Keys screen adds FindAll company discovery</div>
-    <ul class="recons" id="prospectList"></ul>
-    <p class="fine">companies by place + industry, from OpenStreetMap — the start of a book of business.</p>
+    <h3>investigations</h3>
+    <ul class="recons" id="invList"></ul>
   </section>
 </aside>
 
 <main class="stage">
   <canvas id="graph"></canvas>
   <div class="stage-top">
-    <input id="searchInput" placeholder="search nodes…" autocomplete="off">
+    <input id="searchInput" placeholder="⌕ search entities across sources…" autocomplete="off">
     <div id="searchResults" hidden></div>
   </div>
   <div class="chips" id="typeChips"></div>
-  <div id="selBar" class="selbar" hidden>
-    <span id="selCount"></span>
-    <button id="btnMerge" title="combine selected nodes into one">merge</button>
-    <button id="btnGroup" title="put selected nodes in a named group">group</button>
-    <button id="btnClearSel" title="clear selection">clear</button>
-  </div>
-  <div id="marquee" class="marquee" hidden></div>
-  <div class="hint">drag to pan · scroll to zoom · drag a node to move it · click a node for detail · shift-click / shift-drag to multi-select</div>
+  <div class="hint">drag to pan · scroll to zoom · drag a node to move it · click a node for transforms</div>
   <div class="counts" id="graphCounts"></div>
+  <div class="transform-toast" id="transformToast" hidden></div>
 </main>
 
 <aside class="right">
-  <section class="panel" id="dossierPanel" hidden>
-    <h3>city dossier</h3>
-    <div class="facts" id="dossierFacts"></div>
-  </section>
   <section class="panel grow">
-    <h3>node detail</h3>
-    <div id="nodeDetail" class="empty">click any node in the web</div>
+    <h3>entity detail</h3>
+    <div id="entityDetail" class="empty">click any entity in the graph</div>
   </section>
-  <section class="panel">
-    <h3>groups</h3>
-    <div id="groupList" class="grouplist"><div class="empty">no groups yet — shift-click nodes to select, then group them</div></div>
+  <section class="panel" id="transformPanel" hidden>
+    <h3>transforms</h3>
+    <div id="transformList" class="tlist"></div>
   </section>
 </aside>
+
+<div class="modal-back" id="entityModal" hidden>
+  <div class="modal">
+    <h3>add entity</h3>
+    <input id="entityValue" placeholder="value — domain, IP, name…" autocomplete="off">
+    <select id="entityTypeSel"></select>
+    <div class="row">
+      <button id="entitySave" class="primary">add to graph</button>
+      <button id="entityCancel">cancel</button>
+    </div>
+  </div>
+</div>
 
 <div class="modal-back" id="noteModal" hidden>
   <div class="modal">
     <h3>analyst note</h3>
-    <input id="noteLabel" placeholder="short label" autocomplete="off">
     <textarea id="noteBody" placeholder="what did you find? paste intel, hunches, follow-ups…"></textarea>
     <div class="row">
       <button id="noteSave" class="primary">add to graph</button>
@@ -106,48 +91,10 @@
 <div class="modal-back" id="keysModal" hidden>
   <div class="modal keymodal">
     <h3>api keys</h3>
-    <p class="fine" style="margin:0">keys unlock the keyed-free sources. they're stored only on this machine (<span class="mono">data/keys.json</span>, never committed) and never sent back to the browser in full. an env var still wins if one is set — no restart needed after saving.</p>
+    <p class="fine" style="margin:0">keys unlock the keyed transforms (Exa web search, Parallel FindAll). they're stored only on this machine (<span class="mono">data/keys.json</span>, never committed) and never sent back to the browser in full. an env var still wins if one is set — no restart needed after saving.</p>
     <div id="keyList" class="keylist"></div>
     <div class="row">
       <button id="keysClose">close</button>
-    </div>
-  </div>
-</div>
-
-<div class="modal-back" id="casesModal" hidden>
-  <div class="modal casemodal">
-    <h3>case files</h3>
-    <p class="fine" style="margin:0">cases are named snapshots of the working graph — nodes, edges, analyst notes, groups, dossier and source states. they live in <span class="mono">data/cases/</span> on this machine (never committed). merges, groups and edits mark the view dirty until you save.</p>
-    <div class="row">
-      <input id="caseName" placeholder="case name — e.g. dakar-ports" autocomplete="off">
-      <button id="caseSave" class="primary" style="flex:none;width:auto">save current graph</button>
-    </div>
-    <div id="caseList" class="caselist"></div>
-    <div class="row">
-      <button id="casesClose">close</button>
-    </div>
-  </div>
-</div>
-
-<div class="modal-back" id="mergeModal" hidden>
-  <div class="modal">
-    <h3>merge nodes</h3>
-    <p class="fine" style="margin:0" id="mergeSummary"></p>
-    <div id="mergeList" class="mergelist"></div>
-    <div class="row">
-      <button id="mergeConfirm" class="primary">merge</button>
-      <button id="mergeCancel">cancel</button>
-    </div>
-  </div>
-</div>
-
-<div class="modal-back" id="groupModal" hidden>
-  <div class="modal">
-    <h3>new group</h3>
-    <input id="groupName" placeholder="group name" autocomplete="off">
-    <div class="row">
-      <button id="groupCreate" class="primary">create group</button>
-      <button id="groupCancel">cancel</button>
     </div>
   </div>
 </div>

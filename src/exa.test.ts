@@ -215,7 +215,9 @@ test("applyBusinessOnly excludes exa but keeps geocode", () => {
   expect(out).toEqual(["geocode", "business"]);
 });
 
-// ---------- launch-form checkbox (DOM-stubbed) ----------
+// ---------- transform panel (DOM-stubbed) ----------
+// The pivot replaced the recon launch form: per-entity transforms are now the
+// "source" surface, rendered by renderDetail() into the transform panel.
 
 function makeEl(tag: string): any {
   const el: any = {
@@ -247,7 +249,7 @@ function makeEl(tag: string): any {
   return el;
 }
 
-test("launch form renders an exa checkbox from /api/source-defs", async () => {
+function bootStub() {
   const byId = new Map<string, any>();
   const docStub: any = {
     readyState: "loading",
@@ -260,74 +262,76 @@ test("launch form renders an exa checkbox from /api/source-defs", async () => {
     addEventListener() {},
   };
   const g: any = globalThis;
-  const prevDoc = g.document, prevWin = g.window, prevFetch = g.fetch;
+  const prev = { document: g.document, window: g.window, fetch: g.fetch };
   g.document = docStub;
   g.window = g;
-  g.fetch = async () => jsonResponse({
-    sources: SOURCE_DEFS.map((d) => ({ key: d.key, label: d.label, business: d.business })),
-  });
-  try {
-    const src = readFileSync(new URL("../public/app.js", import.meta.url).pathname, "utf8");
-    (0, eval)(src);
-    await g.__meridian.renderSourceChecks();
-    const box = byId.get("sourceChecks");
-    const labels: string[] = box.children.map((c: any) => c._html);
-    const exa = labels.find((h) => h.includes('value="exa"'));
-    expect(exa).toBeDefined();
-    expect(exa).toContain('data-business="0"');
-  } finally {
-    g.document = prevDoc; g.window = prevWin; g.fetch = prevFetch;
-    delete g.__meridian;
-  }
-});
-
-// ---------- Keys screen row (DOM-stubbed) ----------
-
-function makeTrackedEl(tag: string): any {
-  const el = makeEl(tag);
-  const subs: Record<string, any> = {};
-  el.querySelector = (s: string) => {
-    if (!subs[s]) subs[s] = { textContent: "", href: "" };
-    return subs[s];
-  };
-  el._subs = subs;
-  return el;
+  g.fetch = async () => ({ ok: true, json: async () => ({}) });
+  const src = readFileSync(new URL("../public/app.js", import.meta.url).pathname, "utf8");
+  (0, eval)(src);
+  return { byId, g, prev };
+}
+function unboot(byId: any, g: any, prev: any) {
+  g.document = prev.document; g.window = prev.window; g.fetch = prev.fetch;
+  delete g.__meridian;
 }
 
-test("Keys screen renders the EXA_API_KEY row from /api/keys", async () => {
-  process.env.EXA_API_KEY = "test-key"; // via env → masked, never the value
-  const byId = new Map<string, any>();
-  const docStub: any = {
-    readyState: "loading",
-    getElementById: (id: string) => {
-      if (!byId.has(id)) byId.set(id, makeTrackedEl("div"));
-      return byId.get(id);
-    },
-    createElement: (t: string) => makeTrackedEl(t),
-    querySelectorAll: () => [],
-    addEventListener() {},
-  };
-  const g: any = globalThis;
-  const prevDoc = g.document, prevWin = g.window, prevFetch = g.fetch;
-  g.document = docStub;
-  g.window = g;
-  g.fetch = async () => jsonResponse({});
+test("entity detail shows applicable transforms for a domain", async () => {
+  const { byId, g, prev } = bootStub();
   try {
-    const src = readFileSync(new URL("../public/app.js", import.meta.url).pathname, "utf8");
-    (0, eval)(src);
-    g.__meridian.renderKeyList(keyStatuses());
-    const box = byId.get("keyList");
-    const rows = box.children.map((c: any) => c._subs);
-    const exa = rows.find((s: any) => s[".keyname"]?.textContent === "Exa");
-    expect(exa).toBeDefined();
-    expect(exa[".ktag"].textContent).toBe("required");
-    expect(exa[".keybenefit"].textContent).toContain("1,000 searches");
-    expect(exa[".keysignup"].href).toContain("dashboard.exa.ai");
-    expect(exa[".keymasked"].textContent).toContain("env");
-    // the full key value must never reach the row
-    expect(JSON.stringify(exa)).not.toContain("test-key");
-  } finally {
-    g.document = prevDoc; g.window = prevWin; g.fetch = prevFetch;
-    delete g.__meridian;
-  }
+    const M = g.__meridian;
+    M.S.types = { domain: { label: "Domain", icon: "🌐", color: "#4A90D9" } };
+    M.S.transforms = [
+      { key: "cert-subdomains", label: "Subdomains · Cert Spotter", description: "CT logs", inputTypes: ["domain"] },
+      { key: "ip-ports", label: "Ports · Shodan", description: "ports", inputTypes: ["ip"] },
+    ];
+    M.S.sim.set("domain:example-com", {
+      id: "domain:example-com", type: "domain", value: "example.com", label: "example.com",
+      properties: { issuer: "Let's Encrypt" }, source: "certspotter",
+      x: 0, y: 0, vx: 0, vy: 0, r: 22, hidden: false,
+    });
+    M.S.selected = "domain:example-com";
+    M.renderDetail();
+    const detail = byId.get("entityDetail")._html;
+    expect(detail).toContain("example.com");
+    expect(detail).toContain("Let&#39;s Encrypt");
+    expect(byId.get("transformPanel").hidden).toBe(false);
+    const tl = byId.get("transformList")._html;
+    expect(tl).toContain("cert-subdomains");
+    expect(tl).not.toContain("ip-ports");
+  } finally { unboot(byId, g, prev); }
+});
+
+test("entity detail with no selection shows the empty state", async () => {
+  const { byId, g, prev } = bootStub();
+  try {
+    const M = g.__meridian;
+    M.S.selected = null;
+    M.renderDetail();
+    expect(byId.get("entityDetail")._html).toContain("click any entity");
+    expect(byId.get("transformPanel").hidden).toBe(true);
+  } finally { unboot(byId, g, prev); }
+});
+
+// ---------- Keys modal rows (DOM-stubbed) ----------
+
+test("Keys modal renders key rows without leaking values", async () => {
+  const { byId, g, prev } = bootStub();
+  g.fetch = async (url: string) => ({
+    ok: true,
+    json: async () => ({
+      keys: [{
+        id: "EXA_API_KEY", name: "Exa", masked: "••••test",
+        benefit: "1,000 searches", signup: "https://dashboard.exa.ai",
+        signupLabel: "exa dashboard",
+      }],
+    }),
+  });
+  try {
+    await g.__meridian.refreshKeys();
+    const html = byId.get("keyList")._html;
+    expect(html).toContain("Exa");
+    expect(html).toContain("••••test");
+    expect(html).toContain("dashboard.exa.ai");
+    expect(html).not.toContain("test-key-full-value");
+  } finally { unboot(byId, g, prev); }
 });

@@ -6,6 +6,8 @@ import {
   createRecon, getRecon, listRecons, updateRecon, deleteRecon, fullRecon,
   createEnrichJob, getEnrichJob, listEnrichJobs, updateEnrichJob, fullEnrichJob,
   createProspectJob, getProspectJob, listProspectJobs, updateProspectJob, fullProspectJob,
+  createInvestigation, getInvestigation, listInvestigations,
+  updateInvestigation, deleteInvestigation, fullInvestigation,
 } from "./db";
 import { resolveDomain, enrichCompanySite } from "./enrich";
 import { runProspect } from "./prospect";
@@ -32,6 +34,11 @@ import {
 import {
   KEY_DEFS, keyStatuses, storeKey, clearStoredKey, resolveKey,
 } from "./keys";
+import {
+  ENTITY_TYPES, entityId, detectEntityType, getTransforms, transformsFor,
+  findTransform, geocodePlace,
+  type Entity, type EntityType, type Elink,
+} from "./transforms";
 import { mergeNodes, mergeCaseInto } from "./graph";
 import { listCases, getCase, saveCase, deleteCase } from "./cases";
 
@@ -298,6 +305,139 @@ const server = Bun.serve({
         }
       }
 
+      // ---------- investigations (Maltego-style entity graphs) ----------
+      if (path === "/api/investigations" && method === "GET")
+        return json({ investigations: listInvestigations() });
+      if (path === "/api/investigations" && method === "POST") {
+        const b = await readBody(req);
+        const name = String(b.name || "Untitled investigation").trim().slice(0, 80);
+        const seedValue = String(b.seedValue || "").trim();
+        const seedType = (b.seedType as EntityType) || detectEntityType(seedValue);
+        if (!seedValue) return json({ error: "seed value is required" }, 400);
+        if (!ENTITY_TYPES[seedType]) return json({ error: "unknown entity type" }, 400);
+        const id = "inv-" + Math.random().toString(36).slice(2, 10);
+        const seed: Entity = {
+          id: entityId(seedType, seedValue), type: seedType, value: seedValue,
+          label: seedValue.slice(0, 60), properties: {}, source: "seed",
+        };
+        if (seedType === "location") {
+          const g = await geocodePlace(seedValue);
+          if (g) { seed.lat = g.lat; seed.lon = g.lon; seed.properties.address = g.display; }
+        }
+        createInvestigation(id, name, [seed]);
+        return json({ investigation: fullInvestigation(getInvestigation(id)!) });
+      }
+      if (path === "/api/entity-types" && method === "GET")
+        return json({ types: ENTITY_TYPES });
+      if (path === "/api/transforms" && method === "GET") {
+        const ts = await getTransforms();
+        return json({ transforms: ts.map((t) => ({
+          key: t.key, label: t.label, description: t.description,
+          inputTypes: t.inputTypes, needsKey: !!t.needsKey,
+        })) });
+      }
+      {
+        const invMatch = path.match(/^\/api\/investigations\/([a-z0-9-]+)(\/.*)?$/);
+        if (invMatch) {
+          const invId = invMatch[1], sub = invMatch[2] || "";
+          const row = getInvestigation(invId);
+          if (!row) return json({ error: "not found" }, 404);
+          if (sub === "" && method === "GET") return json({ investigation: fullInvestigation(row) });
+          if (sub === "" && method === "DELETE") { deleteInvestigation(invId); return json({ ok: true }); }
+          if (sub === "/entities" && method === "POST") {
+            const b = await readBody(req);
+            const value = String(b.value || "").trim();
+            const type = (b.type as EntityType) || detectEntityType(value);
+            if (!value) return json({ error: "value is required" }, 400);
+            if (!ENTITY_TYPES[type]) return json({ error: "unknown entity type" }, 400);
+            const inv = fullInvestigation(row);
+            const ent: Entity = {
+              id: entityId(type, value), type, value,
+              label: String(b.label || value).slice(0, 60),
+              properties: (b.properties && typeof b.properties === "object") ? b.properties : {},
+              source: "manual",
+            };
+            if (type === "location" && ent.lat == null) {
+              const g = await geocodePlace(value);
+              if (g) { ent.lat = g.lat; ent.lon = g.lon; }
+            }
+            if (!inv.entities.some((x: Entity) => x.id === ent.id)) inv.entities.push(ent);
+            updateInvestigation(invId, inv.entities, inv.links);
+            return json({ investigation: fullInvestigation(getInvestigation(invId)!) });
+          }
+          if (sub === "/transform" && method === "POST") {
+            const b = await readBody(req);
+            const t = await findTransform(String(b.transformKey || ""));
+            if (!t) return json({ error: "unknown transform" }, 404);
+            const inv = fullInvestigation(row);
+            const target = inv.entities.find((x: Entity) => x.id === String(b.entityId || ""));
+            if (!target) return json({ error: "entity not in investigation" }, 404);
+            if (!t.inputTypes.includes(target.type))
+              return json({ error: "transform doesn't accept this entity type" }, 400);
+            const keys: Record<string, string> = {};
+            if (t.needsKey === "exa") keys.exa = resolveKey("EXA_API_KEY");
+            if (t.needsKey === "parallel") keys.parallel = resolveKey("PARALLEL_API_KEY");
+            const r = await t.run(target, keys);
+            const have = new Set(inv.entities.map((x: Entity) => x.id));
+            let addedE = 0, addedL = 0;
+            for (const ne of r.entities) {
+              if (have.has(ne.id)) continue;
+              have.add(ne.id); inv.entities.push(ne); addedE++;
+            }
+            const haveL = new Set(inv.links.map((l: Elink) => `${l.from}>${l.to}>${l.label}`));
+            for (const nl of r.links) {
+              const k = `${nl.from}>${nl.to}>${nl.label}`;
+              if (haveL.has(k)) continue;
+              if (!have.has(nl.from) || !have.has(nl.to)) continue;
+              haveL.add(k); inv.links.push(nl); addedL++;
+            }
+            updateInvestigation(invId, inv.entities, inv.links);
+            return json({
+              note: r.note, addedEntities: addedE, addedLinks: addedL,
+              investigation: fullInvestigation(getInvestigation(invId)!),
+            });
+          }
+          if (sub === "/note" && method === "POST") {
+            const b = await readBody(req);
+            const text = String(b.text || "").trim();
+            if (!text) return json({ error: "text is required" }, 400);
+            const inv = fullInvestigation(row);
+            const nent: Entity = {
+              id: `note:${Date.now().toString(36)}${Math.random().toString(36).slice(2, 6)}`,
+              type: "note", value: text.slice(0, 120), label: text.slice(0, 60),
+              properties: { body: text }, source: "analyst",
+            };
+            inv.entities.push(nent);
+            if (b.entityId) inv.links.push({ from: String(b.entityId), to: nent.id, label: "note" });
+            updateInvestigation(invId, inv.entities, inv.links);
+            return json({ investigation: fullInvestigation(getInvestigation(invId)!) });
+          }
+          return json({ error: "not found" }, 404);
+        }
+      }
+      // ---------- unified entity search (Maltego Search) ----------
+      if (path === "/api/search" && method === "POST") {
+        const b = await readBody(req);
+        const query = String(b.query || "").trim();
+        if (!query) return json({ error: "query is required" }, 400);
+        const type = ((b.type as EntityType) || detectEntityType(query));
+        if (!ENTITY_TYPES[type]) return json({ error: "unknown entity type" }, 400);
+        const results: Entity[] = [{
+          id: entityId(type, query), type, value: query, label: query.slice(0, 60),
+          properties: {}, source: "search",
+        }];
+        if (type === "company") {
+          const t = await findTransform("company-gleif");
+          if (t) for (const e of (await t.run(results[0], {})).entities.slice(0, 5)) results.push(e);
+        }
+        if (type === "person") {
+          const t = await findTransform("person-papers");
+          if (t) for (const e of (await t.run(results[0], {})).entities.filter((x) => x.type === "person").slice(0, 3)) results.push(e);
+        }
+        const seen = new Set<string>();
+        const deduped = results.filter((e) => !seen.has(e.id) && (seen.add(e.id), true));
+        return json({ query, type, entities: deduped.slice(0, 12) });
+      }
       // ---------- case files ----------
       // Cases are the durable layer for analysis work: a named snapshot of
       // the working graph (nodes, edges, analyst notes, groups, dossier,
