@@ -37,7 +37,7 @@ test("entity-types + transforms endpoints", async () => {
   const t = await api("/api/entity-types");
   expect(Object.keys(t.types).length).toBe(12);
   const tr = await api("/api/transforms");
-  expect(tr.transforms.length).toBe(13);
+  expect(tr.transforms.length).toBe(14);
   expect(tr.transforms.every((x: any) => x.key && x.label && x.inputTypes)).toBe(true);
 });
 

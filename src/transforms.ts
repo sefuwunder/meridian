@@ -424,6 +424,111 @@ async function buildTransforms(): Promise<TransformDef[]> {
     }
   ));
 
+  // ---------- company → manufacturers (SUDOKN / NSF Open Knowledge Network) ----------
+  defs.push(await safeRun(
+    {
+      key: "company-sudokn", label: "Manufacturers · SUDOKN",
+      description: "US small/medium manufacturers: street addresses, geo, NAICS, certifications, capabilities",
+      inputTypes: ["company"],
+    },
+    async (e) => {
+      const NS = "http://asu.edu/semantics/SUDOKN/";
+      const sparql = async (q: string) => fetchJson(
+        `https://apps.okn.us/sudokn/sparql?query=${encodeURIComponent(q)}`,
+        { headers: { Accept: "application/sparql-results+json" } }, 30000);
+      const rows = (j: any): any[] => Array.isArray(j?.results?.bindings) ? j.results.bindings : [];
+      const lit = (b: any, k: string): string => {
+        const v = b?.[k]?.value;
+        return v == null ? "" : String(v);
+      };
+      // escape for a SPARQL "..." literal used inside REGEX(..., "i")
+      const needle = e.value.replace(/\\/g, "\\\\").replace(/"/g, '\\"')
+        .replace(/[.*+?^${}()|[\]]/g, "\\$&").slice(0, 60);
+      if (!needle.trim()) return { entities: [], links: [], note: "empty company name" };
+      const found = rows(await sparql(
+        `SELECT ?s ?name WHERE { ` +
+        `?s a <https://spec.industrialontologies.org/ontology/core/Core/Manufacturer> . ` +
+        `?s <http://www.w3.org/2000/01/rdf-schema#label> ?name . ` +
+        `FILTER(REGEX(?name, "${needle}", "i")) } LIMIT 5`));
+      const entities: Entity[] = [], links: Elink[] = [];
+      const seenCo = new Set<string>();
+      const P = (p: string) => `<${NS}${p}>`;
+      for (const f of found) {
+        const uri = lit(f, "s"), name = lit(f, "name").slice(0, 90);
+        if (!uri || !name || seenCo.has(uri)) continue;
+        seenCo.add(uri);
+        const U = `<${uri}>`;
+        const d = rows(await sparql(
+          `PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ` +
+          `PREFIX s: <https://schema.org/> ` +
+          `PREFIX geo: <http://www.opengis.net/ont/geosparql#> ` +
+          `SELECT ?desc ?emp ?web ?email ?street ?postal ?phone ?city ?state ?country ?wkt ?naics WHERE { ` +
+          `${U} rdfs:label ?name . ` +
+          `OPTIONAL { ${U} ${P("hasBusinessDescription")}/${P("hasTextValue")} ?desc } ` +
+          `OPTIONAL { ${U} ${P("hasNumberOfEmployees")} ?emp } ` +
+          `OPTIONAL { ${U} ${P("hasWebAddress")}/${P("hasVirtualLocationIdentifierValue")} ?web } ` +
+          `OPTIONAL { ${U} ${P("hasEmailAddress")}/${P("hasVirtualLocationIdentifierValue")} ?email } ` +
+          `OPTIONAL { ${U} ${P("hasPrimaryNAICSClassifier")}/rdfs:label ?naics } ` +
+          `OPTIONAL { ${U} ${P("organizationLocatedIn")} ?g . ` +
+          `OPTIONAL { ?g s:streetAddress ?street } ` +
+          `OPTIONAL { ?g s:postalCode ?postal } ` +
+          `OPTIONAL { ?g s:telephone ?phone } ` +
+          `OPTIONAL { ?g ${P("locatedInCity")}/rdfs:label ?city } ` +
+          `OPTIONAL { ?g ${P("locatedInState")}/rdfs:label ?state } ` +
+          `OPTIONAL { ?g ${P("locatedInCountry")}/rdfs:label ?country } ` +
+          `OPTIONAL { ?g <http://www.opengis.net/ont/geosparql#hasGeometry>/<http://www.opengis.net/ont/geosparql#asWKT> ?wkt } } } LIMIT 1`))[0] || {};
+        const multi = rows(await sparql(
+          `PREFIX rdfs: <http://www.w3.org/2000/01/rdf-schema#> ` +
+          `SELECT ?kind ?label WHERE { { ${U} ${P("hasCertificate")} ?x . ?x a ?t . ?t rdfs:label ?label . BIND("cert" AS ?kind) } ` +
+          `UNION { ${U} ${P("suppliesToIndustry")}/rdfs:label ?label . BIND("industry" AS ?kind) } ` +
+          `UNION { ${U} ${P("hasProcessCapability")}/rdfs:label ?label . BIND("process" AS ?kind) } ` +
+          `UNION { ${U} ${P("hasMaterialCapability")}/rdfs:label ?label . BIND("material" AS ?kind) } ` +
+          `UNION { ${U} ${P("manufactures")}/rdfs:label ?label . BIND("product" AS ?kind) } } LIMIT 40`));
+        const byKind = (k: string) => [...new Set(multi.filter((m) => lit(m, "kind") === k).map((m) => lit(m, "label")).filter(Boolean))];
+        const props: Record<string, string> = {};
+        const desc = lit(d, "desc"); if (desc) props.description = desc.slice(0, 200);
+        const emp = lit(d, "emp"); if (emp) props.employees = emp;
+        const naics = lit(d, "naics"); if (naics) props.naics = naics;
+        const web = lit(d, "web"); if (web) props.website = web;
+        const phone = lit(d, "phone"); if (phone) props.phone = phone;
+        const email = lit(d, "email"); if (email) props.email = email;
+        const join = (k: string) => byKind(k).slice(0, 8).join(", ").slice(0, 160);
+        for (const [k, pk] of [["industry", "industries"], ["process", "processes"], ["material", "materials"], ["product", "products"]] as const) {
+          const j = join(k); if (j) props[pk] = j;
+        }
+        const coId = entityId("company", name);
+        entities.push(mkEntity("company", name, "sudokn", {
+          properties: props,
+          url: web ? `https://${web.replace(/^https?:\/\//, "")}` : undefined,
+        }));
+        links.push({ from: e.id, to: coId, label: "matched in SUDOKN" });
+        // location entity from the street address + WKT point
+        const addr = [lit(d, "street"), [lit(d, "city"), lit(d, "state")].filter(Boolean).join(", "), lit(d, "postal")].filter(Boolean).join(", ");
+        if (addr) {
+          const extra: Partial<Entity> = {
+            label: addr.slice(0, 80),
+            properties: {
+              ...(lit(d, "city") ? { city: lit(d, "city") } : {}),
+              ...(lit(d, "state") ? { state: lit(d, "state") } : {}),
+              ...(lit(d, "country") ? { country: lit(d, "country") } : {}),
+              ...(lit(d, "postal") ? { postal: lit(d, "postal") } : {}),
+            },
+          };
+          const m = /POINT\(([-\d.]+)\s+([-\d.]+)\)/.exec(lit(d, "wkt"));
+          if (m) { extra.lon = Number(m[1]); extra.lat = Number(m[2]); }
+          entities.push(mkEntity("location", addr, "sudokn", extra));
+          links.push({ from: coId, to: entityId("location", addr), label: "located at" });
+        }
+        // certificate documents
+        for (const c of byKind("cert").slice(0, 5)) {
+          entities.push(mkEntity("document", `${name} — ${c}`, "sudokn", { label: c.slice(0, 60) }));
+          links.push({ from: coId, to: entityId("document", `${name} — ${c}`), label: "certified" });
+        }
+      }
+      return { entities, links, note: `${seenCo.size} SUDOKN manufacturers` };
+    }
+  ));
+
   // ---------- person → papers (OpenAlex) ----------
   defs.push(await safeRun(
     {

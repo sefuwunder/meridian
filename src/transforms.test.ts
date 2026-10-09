@@ -45,9 +45,9 @@ test("detectEntityType: ip, email, phone, url, domain, netblock, fallback", () =
 
 // ---------- transform registry ----------
 
-test("registry: 13 transforms, all well-formed", async () => {
+test("registry: 14 transforms, all well-formed", async () => {
   const ts = await getTransforms();
-  expect(ts.length).toBe(13);
+  expect(ts.length).toBe(14);
   const keys = new Set<string>();
   for (const t of ts) {
     expect(t.key.length).toBeGreaterThan(0);
@@ -182,4 +182,55 @@ test("web-search without key → key-missing note (no throw)", async () => {
   const r = await t.run({ id: "domain:example-com", type: "domain", value: "example.com", label: "e", properties: {}, source: "s" }, {});
   expect(r.entities).toEqual([]);
   expect(r.note).toMatch(/key missing/i);
+});
+
+test("company-sudokn: manufacturers with address, geo, certs", async () => {
+  const C = "http://asu.edu/semantics/SUDOKN/101machine.com-company-instance";
+  stubFetch((url) => {
+    expect(url).toContain("apps.okn.us/sudokn/sparql");
+    if (url.includes("Manufacturer")) {
+      return { results: { bindings: [{ s: { value: C }, name: { value: "101 Machine" } }] } };
+    }
+    if (url.includes("BIND(")) {
+      return { results: { bindings: [
+        { kind: { value: "cert" }, label: { value: "ISO 9001 Certificate" } },
+        { kind: { value: "industry" }, label: { value: "Aerospace" } },
+        { kind: { value: "process" }, label: { value: "CNC Machining" } },
+      ] } };
+    }
+    return { results: { bindings: [{
+      desc: { value: "Prototype machine shop" }, emp: { value: "3" },
+      web: { value: "101machine.com" }, email: { value: "info@101machine.com" },
+      street: { value: "1937 Evans Rd" }, postal: { value: "27513" }, phone: { value: "919-650-3795" },
+      city: { value: "Cary" }, state: { value: "North Carolina" }, country: { value: "US" },
+      wkt: { value: "POINT(-78.803482 35.819162)" }, naics: { value: "Machine Shops" },
+    }] } };
+  });
+  const t = (await findTransform("company-sudokn"))!;
+  expect(t.inputTypes).toContain("company");
+  expect(t.needsKey).toBeUndefined();
+  const r = await t.run({ id: "company:acme", type: "company", value: "101 Machine", label: "101 Machine", properties: {}, source: "s" }, {});
+  const co = r.entities.find((e) => e.type === "company" && e.value === "101 Machine");
+  expect(co).toBeTruthy();
+  expect(co?.properties.employees).toBe("3");
+  expect(co?.properties.phone).toBe("919-650-3795");
+  expect(co?.properties.industries).toContain("Aerospace");
+  const loc = r.entities.find((e) => e.type === "location");
+  expect(loc?.value).toContain("1937 Evans Rd");
+  expect(loc?.lat).toBeCloseTo(35.819162, 4);
+  expect(loc?.lon).toBeCloseTo(-78.803482, 4);
+  expect(loc?.properties.city).toBe("Cary");
+  expect(r.links.some((l) => l.label === "located at")).toBe(true);
+  const doc = r.entities.find((e) => e.type === "document");
+  expect(doc?.label).toBe("ISO 9001 Certificate");
+  expect(r.links.some((l) => l.label === "certified")).toBe(true);
+  expect(r.note).toContain("1 SUDOKN manufacturers");
+});
+
+test("company-sudokn: no matches → empty, not failed", async () => {
+  stubFetch(() => ({ results: { bindings: [] } }));
+  const t = (await findTransform("company-sudokn"))!;
+  const r = await t.run({ id: "company:zz", type: "company", value: "Nonexistent Corp XYZ", label: "x", properties: {}, source: "s" }, {});
+  expect(r.entities).toEqual([]);
+  expect(r.note).toMatch(/0 SUDOKN/);
 });
