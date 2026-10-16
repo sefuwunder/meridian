@@ -4,7 +4,7 @@ Start from any entity — a domain, an IP, a company name, a person — and grow
 an investigation graph by running **transforms**. Each transform takes one
 entity and fans out into new entities connected by labeled links, Maltego-style.
 
-`meridian` ships **13 transforms** over free and keyless sources (Shodan
+`meridian` ships **16 transforms** over free and keyless sources (Shodan
 InternetDB, Cert Spotter, mnemonic passive DNS, IPQuery, urlscan.io, GLEIF,
 SEC EDGAR, OpenAlex, OpenFEC, OpenStreetMap, adsb.lol) plus two keyed ones
 (Exa web search, Parallel FindAll — keys on the Keys screen, never committed).
@@ -59,6 +59,9 @@ document 📄, analyst note 📝. Entity ids are deterministic
 | `domain-scans` | domain | recent urlscan.io scans + hosting IPs |
 | `ip-ports` | ip | open ports, hostnames, CVEs (Shodan InternetDB) |
 | `ip-intel` | ip | ISP/ASN/geo/risk (IPQuery) |
+| `ip-risk` | ip | time-decaying risk verdict + evidence taxonomy (IP99, keyless) |
+| `domain-footprint` | domain | passive DNS, CT certs, same-cert sibling domains (IP99, keyless) |
+| `company-sudokn` | company | US manufacturers: addresses, geo, NAICS, certs (SUDOKN) |
 | `company-gleif` | company | LEI registry matches + parent companies |
 | `company-findall` | company 🔑 | AI company profile (Parallel) |
 | `company-sec` | company | SEC EDGAR filer match |

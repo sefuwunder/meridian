@@ -312,6 +312,174 @@ async function buildTransforms(): Promise<TransformDef[]> {
     }
   ));
 
+  // ---------- ip → risk verdict (IP99) ----------
+  // Keyless. Time-decaying risk score with an evidence taxonomy
+  // (proxy/vpn/dialup_pool/cloud_phone/hijacked_proxy) + evidence_state triage.
+  // The score measures evidence freshness, not P(attacker): the verdict is
+  // always presented behind evidence_state, and a 0 is never "clean".
+  // Licensing: IP99 asks consumers to "query at decision time; do not cache
+  // verdicts", so the score is marked point-in-time and every run re-queries
+  // live — Meridian keeps no standing copy of IP99 data.
+  // Anonymous quota: 500/day + 60/min per client IP (HTTP 429 on exhaustion).
+  defs.push(await safeRun(
+    {
+      key: "ip-risk", label: "IP risk \u00b7 IP99",
+      description: "Time-decaying risk verdict with evidence taxonomy for this IP (proxy/vpn/hijacked signals). Point-in-time \u2014 re-run for a fresh verdict.",
+      inputTypes: ["ip"],
+    },
+    async (e) => {
+      let j: any;
+      try {
+        j = await fetchJson(`https://ip99.com/v1/ip/${encodeURIComponent(e.value)}`, {}, 15000);
+      } catch (err: any) {
+        if (/HTTP 429/.test(String(err?.message || ""))) {
+          return { entities: [], links: [], note: "IP99 anonymous quota exhausted (500/day, 60/min per IP) \u2014 retry later" };
+        }
+        throw err;
+      }
+      if (!j || typeof j !== "object") return { entities: [], links: [], note: "no data for this IP" };
+      const risk = (j.risk && typeof j.risk === "object") ? j.risk : {};
+      const net = (j.network && typeof j.network === "object") ? j.network : {};
+      const geo = (j.geo && typeof j.geo === "object") ? j.geo : {};
+      const score = Number.isFinite(Number(risk.score)) ? Number(risk.score) : 0;
+      const level = String(risk.level || "unknown");
+      const estate = String(j.evidence_state || "unknown");
+      const signals = Array.isArray(risk.signals) ? risk.signals.map((x: any) => String(x)).filter(Boolean) : [];
+      const props: Record<string, string> = {
+        risk: `${score} (${level})`,
+        evidence: estate, // verdict lives behind evidence_state; 0 is never "clean"
+        freshness: "point-in-time \u2014 re-run for a current verdict",
+      };
+      if (signals.length) props.signals = signals.slice(0, 6).join(", ").slice(0, 120);
+      if (net.usage_type) props.usage = String(net.usage_type).slice(0, 40);
+      if (net.asn != null) props.asn = String(net.asn);
+      const geoLabel = [geo.city, geo.region, geo.country].filter(Boolean).join(", ");
+      if (geoLabel) props.geo = geoLabel.slice(0, 80);
+      if (j.computed_at) props.observed = String(j.computed_at).slice(0, 25);
+      const entities: Entity[] = [mkEntity("ip", e.value, "ip99", {
+        properties: props,
+        lat: Number.isFinite(Number(geo.lat)) ? Number(geo.lat) : undefined,
+        lon: Number.isFinite(Number(geo.lon)) ? Number(geo.lon) : undefined,
+      })];
+      const links: Elink[] = [];
+      if (net.asn != null && String(net.asn).trim() !== "") {
+        const asn = String(net.asn).toUpperCase().startsWith("AS") ? String(net.asn).toUpperCase() : `AS${net.asn}`;
+        entities.push(mkEntity("as", asn, "ip99", { label: asn }));
+        links.push({ from: e.id, to: entityId("as", asn), label: "announced by" });
+      }
+      if (geoLabel) {
+        const extra: Partial<Entity> = { label: geoLabel.slice(0, 80), properties: {} };
+        if (Number.isFinite(Number(geo.lat))) extra.lat = Number(geo.lat);
+        if (Number.isFinite(Number(geo.lon))) extra.lon = Number(geo.lon);
+        entities.push(mkEntity("location", geoLabel, "ip99", extra));
+        links.push({ from: e.id, to: entityId("location", geoLabel), label: "geolocated to" });
+      }
+      return { entities, links, note: `risk ${score} (${level}) \u2014 ${estate}` };
+    }
+  ));
+
+  // ---------- domain → DNS + cert footprint (IP99) ----------
+  // Keyless. Passive DNS rows → ip entities; CT certs → document entities;
+  // each cert fingerprint expands to sibling domains on the same cert
+  // (same-cert phishing-cluster pivot). Caps keep the anonymous 500/day +
+  // 60/min quota in check; a 429 anywhere yields the quota note.
+  defs.push(await safeRun(
+    {
+      key: "domain-footprint", label: "DNS + certs \u00b7 IP99",
+      description: "Passive DNS, certificate-transparency certs, and same-cert sibling domains for this domain",
+      inputTypes: ["domain"],
+    },
+    async (e) => {
+      const domain = e.value.toLowerCase();
+      const quotaNote = "IP99 anonymous quota exhausted (500/day, 60/min per IP) \u2014 retry later";
+      let quotaHit = false;
+      const get = async (url: string): Promise<any | null> => {
+        try {
+          return await fetchJson(url, {}, 15000);
+        } catch (err: any) {
+          if (/HTTP 429/.test(String(err?.message || ""))) quotaHit = true;
+          return null;
+        }
+      };
+      const entities: Entity[] = [], links: Elink[] = [];
+      const seenIp = new Set<string>(), seenDoc = new Set<string>(), seenDom = new Set<string>();
+      // passive DNS
+      const dns = await get(`https://ip99.com/v1/domain/dns/${encodeURIComponent(domain)}`);
+      const rows = Array.isArray(dns?.data) ? dns.data : [];
+      for (const r of rows) {
+        if (!r || typeof r !== "object") continue;
+        const rrtype = String(r.rrtype || "").toUpperCase();
+        const val = String(r.value || "").trim().replace(/\.$/, "");
+        if (!val) continue;
+        if ((rrtype === "A" || rrtype === "AAAA") && /^(\d{1,3}\.){3}\d{1,3}$/.test(val)) {
+          if (seenIp.has(val) || seenIp.size >= 20) continue;
+          seenIp.add(val);
+          entities.push(mkEntity("ip", val, "ip99", {
+            properties: {
+              ...(r.first_seen ? { first_seen: String(r.first_seen).slice(0, 19) } : {}),
+              ...(r.last_seen ? { last_seen: String(r.last_seen).slice(0, 19) } : {}),
+              via: "IP99 passive DNS",
+            },
+          }));
+          links.push({ from: e.id, to: entityId("ip", val), label: "resolved to" });
+        } else if (rrtype === "CNAME" && /^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/i.test(val)) {
+          const cn = val.toLowerCase();
+          if (seenDom.has(cn) || seenDom.size >= 20) continue;
+          seenDom.add(cn);
+          entities.push(mkEntity("domain", cn, "ip99", { properties: { via: "IP99 passive DNS" } }));
+          links.push({ from: e.id, to: entityId("domain", cn), label: "points to" });
+        }
+      }
+      // CT certs → fingerprints → sibling domains
+      const certs = await get(`https://ip99.com/v1/domain/certs/${encodeURIComponent(domain)}`);
+      const certRows = Array.isArray(certs?.data) ? certs.data.slice(0, 5) : [];
+      const fpJobs: Array<Promise<any>> = [];
+      for (const c of certRows) {
+        if (!c || typeof c !== "object") continue;
+        const fp = String(c.fingerprint || "").toLowerCase();
+        if (!/^[0-9a-f]{32,128}$/.test(fp) || seenDoc.has(fp)) continue;
+        seenDoc.add(fp);
+        const docVal = `${domain} cert ${fp.slice(0, 16)}`;
+        entities.push(mkEntity("document", docVal, "ip99", {
+          label: `cert ${fp.slice(0, 16)}\u2026`,
+          properties: {
+            fingerprint: fp,
+            ...(c.issuer_org ? { issuer: String(c.issuer_org).slice(0, 60) } : {}),
+            ...(c.log_source ? { log: String(c.log_source).slice(0, 40) } : {}),
+            ...(c.not_before ? { not_before: String(c.not_before).slice(0, 19) } : {}),
+          },
+        }));
+        links.push({ from: e.id, to: entityId("document", docVal), label: "issued cert" });
+        fpJobs.push(get(`https://ip99.com/v1/domain/fingerprint/${fp}`));
+      }
+      const sibs = await Promise.all(fpJobs);
+      for (const s of sibs) {
+        for (const d of (Array.isArray(s?.data) ? s.data : [])) {
+          if (!d || typeof d !== "object") continue;
+          const name = String(d.domain || "").trim().toLowerCase().replace(/^\*\./, "");
+          if (!name || name === domain || !/^[a-z0-9][a-z0-9.-]*\.[a-z]{2,}$/.test(name)) continue;
+          if (seenDom.has(name) || seenDom.size >= 40) continue;
+          seenDom.add(name);
+          entities.push(mkEntity("domain", name, "ip99", {
+            properties: {
+              ...(d.wildcard ? { wildcard: "yes" } : {}),
+              ...(d.first_seen ? { first_seen: String(d.first_seen).slice(0, 19) } : {}),
+              ...(d.last_seen ? { last_seen: String(d.last_seen).slice(0, 19) } : {}),
+              via: "same certificate",
+            },
+          }));
+          links.push({ from: e.id, to: entityId("domain", name), label: "shares cert with" });
+        }
+      }
+      if (quotaHit && entities.length === 0) return { entities: [], links: [], note: quotaNote };
+      const bits = [];
+      if (seenIp.size) bits.push(`${seenIp.size} resolved IPs`);
+      if (seenDoc.size) bits.push(`${seenDoc.size} certs`);
+      if (seenDom.size) bits.push(`${seenDom.size} linked domains`);
+      return { entities, links, note: bits.length ? bits.join(", ") : (quotaHit ? quotaNote : "no IP99 footprint") };
+    }
+  ));
+
 
   // ---------- company → LEI records (GLEIF name search) ----------
   defs.push(await safeRun(

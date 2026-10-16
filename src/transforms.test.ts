@@ -45,9 +45,9 @@ test("detectEntityType: ip, email, phone, url, domain, netblock, fallback", () =
 
 // ---------- transform registry ----------
 
-test("registry: 14 transforms, all well-formed", async () => {
+test("registry: 16 transforms, all well-formed", async () => {
   const ts = await getTransforms();
-  expect(ts.length).toBe(14);
+  expect(ts.length).toBe(16);
   const keys = new Set<string>();
   for (const t of ts) {
     expect(t.key.length).toBeGreaterThan(0);
@@ -60,12 +60,13 @@ test("registry: 14 transforms, all well-formed", async () => {
   }
 });
 
-test("transformsFor: domain gets 4 transforms incl. web-search", async () => {
+test("transformsFor: domain gets 5 transforms incl. web-search", async () => {
   const ts = await transformsFor("domain");
   const keys = ts.map((t) => t.key);
   expect(keys).toContain("cert-subdomains");
   expect(keys).toContain("dns-history");
   expect(keys).toContain("domain-scans");
+  expect(keys).toContain("domain-footprint");
   expect(keys).toContain("web-search");
   expect(keys).not.toContain("ip-ports");
 });
@@ -233,4 +234,77 @@ test("company-sudokn: no matches → empty, not failed", async () => {
   const r = await t.run({ id: "company:zz", type: "company", value: "Nonexistent Corp XYZ", label: "x", properties: {}, source: "s" }, {});
   expect(r.entities).toEqual([]);
   expect(r.note).toMatch(/0 SUDOKN/);
+});
+
+test("ip-risk: verdict behind evidence_state, as + location entities", async () => {
+  stubFetch((url) => {
+    expect(url).toContain("ip99.com/v1/ip/");
+    return {
+      ip: "1.2.3.4", computed_at: "2026-10-16T12:00:00Z", evidence_state: "active",
+      risk: { score: 72, level: "high", signals: ["proxy", "vpn", "hosting"] },
+      network: { asn: 12345, usage_type: "ISP" },
+      geo: { city: "Lagos", region: "Lagos", country: "NG", lat: 6.5, lon: 3.4, tz: "Africa/Lagos" },
+    };
+  });
+  const t = (await findTransform("ip-risk"))!;
+  expect(t.inputTypes).toContain("ip");
+  expect(t.needsKey).toBeUndefined();
+  const r = await t.run({ id: "ip:1-2-3-4", type: "ip", value: "1.2.3.4", label: "1.2.3.4", properties: {}, source: "s" }, {});
+  const ip = r.entities.find((e) => e.type === "ip");
+  expect(ip?.properties.risk).toBe("72 (high)");
+  expect(ip?.properties.evidence).toBe("active");
+  expect(ip?.properties.signals).toContain("proxy");
+  expect(ip?.properties.freshness).toMatch(/point-in-time/);
+  const as = r.entities.find((e) => e.type === "as");
+  expect(as?.value).toBe("AS12345");
+  expect(r.links.find((l) => l.to === as!.id)?.label).toBe("announced by");
+  const loc = r.entities.find((e) => e.type === "location");
+  expect(loc?.value).toContain("Lagos");
+  expect(loc?.lat).toBeCloseTo(6.5, 4);
+  expect(r.links.some((l) => l.label === "geolocated to")).toBe(true);
+  expect(r.note).toMatch(/risk 72 \(high\) \u2014 active/);
+});
+
+test("ip-risk: 429 → quota note, no throw", async () => {
+  (globalThis as any).fetch = async () => ({ ok: false, status: 429, json: async () => ({}) }) as any;
+  const t = (await findTransform("ip-risk"))!;
+  const r = await t.run({ id: "ip:1-2-3-4", type: "ip", value: "1.2.3.4", label: "1.2.3.4", properties: {}, source: "s" }, {});
+  expect(r.entities).toEqual([]);
+  expect(r.note).toMatch(/quota exhausted/);
+});
+
+test("domain-footprint: dns + certs + same-cert siblings", async () => {
+  const FP = "85ca6ab068e9bcce88b6c4aa3c47f7d17228134a457f870d3800e6223a0df07a";
+  stubFetch((url) => {
+    if (url.includes("/v1/domain/dns/")) {
+      return { count: 2, data: [
+        { first_seen: "2025-04-10", last_seen: "2025-04-10", rrtype: "A", value: "93.184.216.34" },
+        { first_seen: "2025-04-10", last_seen: "2025-04-10", rrtype: "CNAME", value: "alias.example.com." },
+      ] };
+    }
+    if (url.includes("/v1/domain/certs/")) {
+      return { count: 1, data: [{ fingerprint: FP, issuer_org: "SSL Corp", log_source: "test-log", not_before: "2026-09-26 22:49:11", wildcard: false }] };
+    }
+    if (url.includes("/v1/domain/fingerprint/")) {
+      expect(url).toContain(FP);
+      return { count: 2, data: [
+        { domain: "example.com", first_seen: "2026-09-26", last_seen: "2026-09-26", wildcard: false },
+        { domain: "evil.example.net", first_seen: "2026-09-27", last_seen: "2026-09-28", wildcard: false },
+      ] };
+    }
+    throw new Error("unexpected url " + url);
+  });
+  const t = (await findTransform("domain-footprint"))!;
+  expect(t.inputTypes).toContain("domain");
+  const r = await t.run({ id: "domain:example-com", type: "domain", value: "example.com", label: "e", properties: {}, source: "s" }, {});
+  const ip = r.entities.find((e) => e.type === "ip");
+  expect(ip?.value).toBe("93.184.216.34");
+  expect(r.links.find((l) => l.to === ip!.id)?.label).toBe("resolved to");
+  const doc = r.entities.find((e) => e.type === "document");
+  expect(doc?.properties.issuer).toBe("SSL Corp");
+  expect(r.links.find((l) => l.to === doc!.id)?.label).toBe("issued cert");
+  const sib = r.entities.find((e) => e.type === "domain" && e.value === "evil.example.net");
+  expect(sib).toBeTruthy();
+  expect(r.links.find((l) => l.to === sib!.id)?.label).toBe("shares cert with");
+  expect(r.note).toMatch(/1 resolved IPs/);
 });
