@@ -9,6 +9,9 @@
 // Zero deps. All transforms are best-effort: one failed source never sinks
 // the transform, and every transform reports what it found.
 
+import { Database } from "bun:sqlite";
+import { existsSync } from "fs";
+
 export type EntityType =
   | "domain" | "ip" | "person" | "company" | "email" | "phone"
   | "location" | "url" | "netblock" | "as" | "document" | "note";
@@ -842,6 +845,71 @@ async function buildTransforms(): Promise<TransformDef[]> {
     }
   ));
 
+  // ---------- location → notable places (Wikimedia Geo local index) ----------
+  defs.push(await safeRun(
+    {
+      key: "wikimedia-geo", label: "Notable places · Wikimedia",
+      description: "QRank-ranked notable places from a local CC0 Wikidata/OSM index (one-time setup, see README)",
+      inputTypes: ["location"],
+    },
+    async (e) => {
+      if (e.lat == null || e.lon == null)
+        return { entities: [], links: [], note: "location has no coordinates" };
+      const dbPath = wikimediaGeoDbPath();
+      if (!dbPath)
+        return { entities: [], links: [], note: "Wikimedia Geo index not configured — see README “Wikimedia Geo setup” (MERIDIAN_WIKIMEDIA_DB)" };
+      const R_KM = 50;
+      const dLat = R_KM / 111.32;
+      const dLon = R_KM / (111.32 * Math.cos(e.lat * Math.PI / 180));
+      const lat0 = e.lat - dLat, lat1 = e.lat + dLat;
+      const lon0 = e.lon - dLon, lon1 = e.lon + dLon;
+      // 1° grid cells spanned by the bbox: cell = (floor(lat)+90)*360 + (floor(lon)+180)
+      const cells: number[] = [];
+      for (let la = Math.floor(lat0); la <= Math.floor(lat1); la++)
+        for (let lo = Math.floor(lon0); lo <= Math.floor(lon1); lo++)
+          cells.push((la + 90) * 360 + (lo + 180));
+      const db = new Database(dbPath, { readonly: true });
+      let rows: Array<{ qid: string; label: string; lat: number; lon: number; qrank: number | null; url: string | null }>;
+      try {
+        rows = db.query(
+          `SELECT qid, label, lat, lon, qrank, url FROM places
+           WHERE cell IN (${cells.map(() => "?").join(",")})
+             AND lat BETWEEN ? AND ? AND lon BETWEEN ? AND ?
+           ORDER BY qrank DESC LIMIT 80`
+        ).all(...cells, lat0, lat1, lon0, lon1) as typeof rows;
+      } finally {
+        db.close();
+      }
+      const havKm = (a: number, b: number, c: number, d: number) => {
+        const R = 6371, t = Math.PI / 180;
+        const s = Math.sin((c - a) * t / 2) ** 2
+          + Math.cos(a * t) * Math.cos(c * t) * Math.sin((d - b) * t / 2) ** 2;
+        return 2 * R * Math.asin(Math.sqrt(s));
+      };
+      const entities: Entity[] = [], links: Elink[] = [];
+      for (const r of rows) {
+        if (!r.qid || !r.label) continue;
+        if (havKm(e.lat, e.lon, r.lat, r.lon) > R_KM) continue;
+        const id = `location:${String(r.qid).toLowerCase()}`; // deterministic per Wikidata item
+        entities.push({
+          id, type: "location", value: r.label,
+          label: r.label.slice(0, 60),
+          properties: {
+            qid: r.qid,
+            ...(r.qrank != null ? { qrank: String(Math.round(r.qrank)) } : {}),
+            via: "Wikimedia Geo (CC0)",
+          },
+          source: "wikimedia-geo",
+          lat: r.lat, lon: r.lon,
+          url: r.url || `https://www.wikidata.org/wiki/${r.qid}`,
+        });
+        links.push({ from: e.id, to: id, label: "notable nearby" });
+        if (entities.length >= 25) break;
+      }
+      return { entities, links, note: `${entities.length} notable places within ${R_KM} km (QRank-ranked)` };
+    }
+  ));
+
   // ---------- any → web search (Exa) ----------
   defs.push(await safeRun(
     {
@@ -892,6 +960,17 @@ export async function transformsFor(type: EntityType): Promise<TransformDef[]> {
 
 export async function findTransform(key: string): Promise<TransformDef | undefined> {
   return (await getTransforms()).find((t) => t.key === key);
+}
+
+/** Resolve the Wikimedia Geo SQLite index path, or null when not configured.
+ * Primary: MERIDIAN_WIKIMEDIA_DB env. Fallback: wikimedia-geo.db next to
+ * meridian's own data dir (both live outside git). Never throws. */
+export function wikimediaGeoDbPath(): string | null {
+  const env = (process.env.MERIDIAN_WIKIMEDIA_DB || "").trim();
+  if (env && existsSync(env)) return env;
+  const fallback = new URL("../data/wikimedia-geo.db", import.meta.url).pathname;
+  if (existsSync(fallback)) return fallback;
+  return null;
 }
 
 /** Geocode a place name → lat/lon via OpenStreetMap Nominatim (for location entities). */

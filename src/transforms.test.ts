@@ -3,6 +3,10 @@
 // boots the real server against a temp data dir.
 
 import { test, expect, beforeAll, afterAll } from "bun:test";
+import { Database } from "bun:sqlite";
+import { mkdtempSync, rmSync } from "fs";
+import { tmpdir } from "os";
+import { join } from "path";
 import {
   ENTITY_TYPES, entityId, detectEntityType,
   getTransforms, transformsFor, findTransform,
@@ -45,9 +49,9 @@ test("detectEntityType: ip, email, phone, url, domain, netblock, fallback", () =
 
 // ---------- transform registry ----------
 
-test("registry: 16 transforms, all well-formed", async () => {
+test("registry: 17 transforms, all well-formed", async () => {
   const ts = await getTransforms();
-  expect(ts.length).toBe(16);
+  expect(ts.length).toBe(17);
   const keys = new Set<string>();
   for (const t of ts) {
     expect(t.key.length).toBeGreaterThan(0);
@@ -307,4 +311,71 @@ test("domain-footprint: dns + certs + same-cert siblings", async () => {
   expect(sib).toBeTruthy();
   expect(r.links.find((l) => l.to === sib!.id)?.label).toBe("shares cert with");
   expect(r.note).toMatch(/1 resolved IPs/);
+});
+
+// ---------- wikimedia-geo (local SQLite fixture, no download needed) ----------
+
+function buildWgeoFixture(): { dir: string; dbPath: string } {
+  const dir = mkdtempSync(join(tmpdir(), "wgeo-"));
+  const dbPath = join(dir, "wgeo.db");
+  const db = new Database(dbPath, { create: true });
+  db.exec(`CREATE TABLE places(
+    qid TEXT PRIMARY KEY, label TEXT NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL,
+    qrank REAL, url TEXT, cell INTEGER NOT NULL);
+    CREATE INDEX idx_cell_qrank ON places(cell, qrank DESC);`);
+  const cell = (lat: number, lon: number) => (Math.floor(lat) + 90) * 360 + (Math.floor(lon) + 180);
+  const ins = db.query(`INSERT INTO places(qid,label,lat,lon,qrank,url,cell) VALUES (?,?,?,?,?,?,?)`);
+  ins.run("Q90", "Paris", 48.8566, 2.3522, 999.0, "https://www.wikidata.org/wiki/Q90", cell(48.8566, 2.3522));
+  ins.run("Q12345", "Eiffel Tower", 48.8584, 2.2945, 900.0, "https://www.wikidata.org/wiki/Q12345", cell(48.8584, 2.2945));
+  ins.run("Q99999", "Far Away Place", 0.0, 0.0, 950.0, null, cell(0, 0)); // outside 50 km
+  db.close();
+  return { dir, dbPath };
+}
+
+test("wikimedia-geo: fixture index → QRank-ranked places, haversine-filtered", async () => {
+  const { dir, dbPath } = buildWgeoFixture();
+  const prev = process.env.MERIDIAN_WIKIMEDIA_DB;
+  process.env.MERIDIAN_WIKIMEDIA_DB = dbPath;
+  try {
+    const t = (await findTransform("wikimedia-geo"))!;
+    expect(t.inputTypes).toContain("location");
+    expect(t.needsKey).toBeUndefined();
+    const r = await t.run(
+      { id: "location:paris", type: "location", value: "Paris", label: "Paris", properties: {}, source: "s", lat: 48.8566, lon: 2.3522 }, {});
+    expect(r.entities.length).toBe(2); // far-away place filtered by haversine
+    expect(r.entities[0].value).toBe("Paris"); // qrank 999 first
+    expect(r.entities[1].value).toBe("Eiffel Tower");
+    expect(r.entities[0].type).toBe("location");
+    expect(r.entities[0].id).toBe("location:q90"); // deterministic per-QID id
+    expect(r.entities[0].properties.qid).toBe("Q90");
+    expect(r.entities[0].properties.qrank).toBe("999");
+    expect(r.entities[0].url).toBe("https://www.wikidata.org/wiki/Q90");
+    expect(r.entities[0].lat).toBeCloseTo(48.8566, 4);
+    expect(r.links.every((l) => l.label === "notable nearby")).toBe(true);
+    expect(r.links[0].from).toBe("location:paris");
+    expect(r.note).toMatch(/2 notable places/);
+    // location without coordinates → graceful note
+    const r2 = await t.run(
+      { id: "location:x", type: "location", value: "X", label: "X", properties: {}, source: "s" }, {});
+    expect(r2.entities).toEqual([]);
+    expect(r2.note).toMatch(/no coordinates/);
+  } finally {
+    if (prev === undefined) delete process.env.MERIDIAN_WIKIMEDIA_DB;
+    else process.env.MERIDIAN_WIKIMEDIA_DB = prev;
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("wikimedia-geo: no index configured → clear note, no throw", async () => {
+  const prev = process.env.MERIDIAN_WIKIMEDIA_DB;
+  delete process.env.MERIDIAN_WIKIMEDIA_DB;
+  try {
+    const t = (await findTransform("wikimedia-geo"))!;
+    const r = await t.run(
+      { id: "location:paris", type: "location", value: "Paris", label: "Paris", properties: {}, source: "s", lat: 48.85, lon: 2.35 }, {});
+    expect(r.entities).toEqual([]);
+    expect(r.note).toMatch(/not configured/);
+  } finally {
+    if (prev !== undefined) process.env.MERIDIAN_WIKIMEDIA_DB = prev;
+  }
 });

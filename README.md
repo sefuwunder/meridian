@@ -4,7 +4,7 @@ Start from any entity — a domain, an IP, a company name, a person — and grow
 an investigation graph by running **transforms**. Each transform takes one
 entity and fans out into new entities connected by labeled links, Maltego-style.
 
-`meridian` ships **16 transforms** over free and keyless sources (Shodan
+`meridian` ships **17 transforms** over free and keyless sources (Shodan
 InternetDB, Cert Spotter, mnemonic passive DNS, IPQuery, urlscan.io, GLEIF,
 SEC EDGAR, OpenAlex, OpenFEC, OpenStreetMap, adsb.lol) plus two keyed ones
 (Exa web search, Parallel FindAll — keys on the Keys screen, never committed).
@@ -43,6 +43,65 @@ its detail and the transforms that accept it; run one and the new entities
 animate into the graph. The top-bar search queries GLEIF / OpenAlex / the raw
 value across sources without leaving the canvas.
 
+## Wikimedia Geo setup (optional, for the `wikimedia-geo` transform)
+
+`wikimedia-geo` answers "notable places near this location" from a **local**
+SQLite index — instant, no rate limits, no API key. The index is built once
+from the CC0 slice of the Wikimedia Enterprise geospatial dataset (2026-09-15
+snapshot): `links.parquet` (174 MB) + `wikidata.parquet` + `wikidata_locations.parquet`
+(~1.6 GB total, all CC0 — no ShareAlike obligations on anything derived).
+The 36 GB OSM table (ODbL) and the Wikipedia/Wikivoyage tables (CC BY-SA) are
+deliberately excluded.
+
+```bash
+# 1. build the index (~1.6 GB download, needs python3 + duckdb)
+mkdir -p ~/wikimedia-geo && cd ~/wikimedia-geo
+python3 /path/to/build-index.py   # see below for the script
+# → wikimedia-geo.db (~2 GB), lives OUTSIDE the repo — never commit it
+
+# 2. point meridian at it (env var wins; no restart needed for the value,
+#    but the server must see the env at boot)
+MERIDIAN_WIKIMEDIA_DB=~/wikimedia-geo/wikimedia-geo.db bun src/server.ts
+```
+
+Without the env var (or `data/wikimedia-geo.db` next to meridian's own DB),
+the transform reports "index not configured" and everything else keeps working.
+
+Build script (`build-index.py`, also kept with the goal notes) — duckdb does the
+12.8M-row join into a staging parquet, then plain `sqlite3` loads it (no
+duckdb extensions needed):
+
+```python
+import duckdb, os, sqlite3, urllib.request
+os.makedirs("parquet", exist_ok=True)
+BASE = "https://huggingface.co/datasets/wikimedia/linked-openstreetmap-wikidata-wikipedia-wikivoyage/resolve/main"
+for f in ["links.parquet", "wikidata.parquet", "wikidata_locations.parquet"]:
+    if not os.path.exists(f"parquet/{f}"):
+        urllib.request.urlretrieve(f"{BASE}/{f}", f"parquet/{f}")
+con = duckdb.connect()
+con.execute("SET memory_limit='3GB'")
+con.execute("""
+  COPY (
+    SELECT w.wikidata_id AS qid, w.label AS label,
+           l.latitude AS lat, l.longitude AS lon, w.qrank AS qrank, w.url AS url,
+           CAST((FLOOR(l.latitude)+90)*360 + (FLOOR(l.longitude)+180) AS INTEGER) AS cell
+    FROM read_parquet('parquet/wikidata_locations.parquet') l
+    JOIN read_parquet('parquet/wikidata.parquet') w USING (wikidata_id)
+    WHERE w.label IS NOT NULL AND l.latitude BETWEEN -90 AND 90 AND l.longitude BETWEEN -180 AND 180
+  ) TO 'places_raw.parquet' (FORMAT PARQUET)
+""")
+lite = sqlite3.connect("wikimedia-geo.db")
+lite.execute("""CREATE TABLE places(
+  qid TEXT PRIMARY KEY, label TEXT NOT NULL, lat REAL NOT NULL, lon REAL NOT NULL,
+  qrank REAL, url TEXT, cell INTEGER NOT NULL)""")
+cur = con.execute("SELECT qid,label,lat,lon,qrank,url,cell FROM read_parquet('places_raw.parquet')")
+while batch := cur.fetchmany(200_000):
+    lite.executemany("INSERT OR IGNORE INTO places VALUES (?,?,?,?,?,?,?)", batch)
+lite.execute("CREATE INDEX idx_cell_qrank ON places(cell, qrank DESC)")
+lite.commit()
+print("places:", lite.execute("SELECT COUNT(*) FROM places").fetchone()[0])
+```
+
 ## Entities
 
 Twelve types, each with its own icon and color: domain 🌐, IP 🖧, person 👤,
@@ -69,6 +128,7 @@ document 📄, analyst note 📝. Entity ids are deterministic
 | `person-donations` | person | campaign-finance recipients (OpenFEC) |
 | `location-places` | location | nearby businesses (OpenStreetMap) |
 | `location-aircraft` | location | live aircraft overhead (ADS-B) |
+| `wikimedia-geo` | location | notable places, QRank-ranked (Wikimedia, local index) |
 | `web-search` | most 🔑 | neural web search (Exa) |
 
 🔑 = needs a key on the Keys screen. Every transform is best-effort: one dead
