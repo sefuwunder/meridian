@@ -49,9 +49,9 @@ test("detectEntityType: ip, email, phone, url, domain, netblock, fallback", () =
 
 // ---------- transform registry ----------
 
-test("registry: 17 transforms, all well-formed", async () => {
+test("registry: 18 transforms, all well-formed", async () => {
   const ts = await getTransforms();
-  expect(ts.length).toBe(17);
+  expect(ts.length).toBe(18);
   const keys = new Set<string>();
   for (const t of ts) {
     expect(t.key.length).toBeGreaterThan(0);

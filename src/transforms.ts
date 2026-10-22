@@ -595,6 +595,102 @@ async function buildTransforms(): Promise<TransformDef[]> {
     }
   ));
 
+  // CompanyData.com.cy — keyless JSON API over the Cyprus Registrar of Companies
+  // (data.gov.cy open-data export, DRCOR, CC BY 4.0). Verified live 2026-10-22.
+  // Greek status/position strings mapped where known; unknown values pass
+  // through raw so new registry values never break the run.
+const CDCY_STATUS_EN: Record<string, string> = {
+  "Εγγεγραμμένη": "registered",
+  "Διαγραμμένη": "struck off",
+  "Στάληκε επιστολή Υπενθύμισης": "reminder letter sent",
+};
+
+const CDCY_POSITION_EN: Record<string, string> = {
+  "Γραμματέας": "secretary",
+  "Διευθυντής": "director",
+};
+
+const CDCY_ORG_RE = /\b(ltd|limited|llc|inc|corp|services|holdings|partners|trust|plc|sarl|gmbh)\b/i;
+
+// ---------- company → Cyprus registry (CompanyData.com.cy) ----------
+defs.push(await safeRun(
+  {
+    key: "company-cyprus", label: "Cyprus registry · CompanyData.com.cy",
+    description: "Cyprus Registrar of Companies via CompanyData.com.cy: registered-office address, officers, status. Keyless, official open data.",
+    inputTypes: ["company"],
+  },
+  async (e) => {
+    const s = await fetchJson(
+      `https://companydata.com.cy/api/search?q=${encodeURIComponent(e.value)}`, {}, 25000);
+    const results = Array.isArray(s?.results) ? s.results : [];
+    const entities: Entity[] = [], links: Elink[] = [];
+    const seenCompanies = new Set<string>();
+    const seenOfficers = new Set<string>();
+    const seenPlaces = new Set<string>();
+
+    for (const r of results.slice(0, 6)) {
+      const regNo = String(r?.registration_no || "").trim();
+      const typeCode = String(r?.type_code || "").trim();
+      const name = String(r?.name || "").slice(0, 90);
+      const cid = `${regNo}-${typeCode}`;
+      if (!regNo || !typeCode || !name || seenCompanies.has(cid)) continue;
+      seenCompanies.add(cid);
+
+      // Detail is best-effort: the search row alone is still a useful hit.
+      let d: any = null;
+      try {
+        d = await fetchJson(`https://companydata.com.cy/api/companies/${cid}`, {}, 25000);
+        if (d?.error) d = null;
+      } catch { /* fall through with the search row */ }
+
+      const statusRaw = String(d?.status ?? r?.status ?? "");
+      const status = CDCY_STATUS_EN[statusRaw] || statusRaw;
+      const registeredOn = String(d?.registered_on ?? r?.registered_on ?? "").slice(0, 10);
+      const addr = d?.address || {};
+      const territory = String(addr?.territory || "").trim();
+      const street = String(addr?.street || "").trim();
+      const props: Record<string, string> = {
+        registration_no: regNo,
+        status,
+        ...(registeredOn ? { registered_on: registeredOn } : {}),
+        ...(territory ? { address: territory } : {}),
+        ...(d?.source?.data_as_of ? { registry_data_as_of: String(d.source.data_as_of).slice(0, 10) } : {}),
+      };
+      const compEnt = mkEntity("company", name, "companydata-cy", {
+        properties: props,
+        url: `https://companydata.com.cy/companies/${cid}`,
+      });
+      entities.push(compEnt);
+      links.push({ from: e.id, to: compEnt.id, label: "registered in Cyprus" });
+
+      if (territory && !seenPlaces.has(territory)) {
+        seenPlaces.add(territory);
+        const label = `${territory}${street ? ` — ${street}` : ""}`.slice(0, 90);
+        entities.push(mkEntity("location", territory, "companydata-cy", {
+          label, properties: { ...(street ? { street } : {}), via: "Cyprus company registry" },
+        }));
+        links.push({ from: compEnt.id, to: entityId("location", territory), label: "registered office in" });
+      }
+
+      for (const o of (Array.isArray(d?.officials) ? d.officials : [])) {
+        const oname = String(o?.name || "").slice(0, 90);
+        if (!oname || seenOfficers.has(oname)) continue;
+        seenOfficers.add(oname);
+        const posRaw = String(o?.position || "");
+        const pos = CDCY_POSITION_EN[posRaw] || posRaw;
+        const otype: EntityType = CDCY_ORG_RE.test(oname) ? "company" : "person";
+        const oent = mkEntity(otype, oname, "companydata-cy", {
+          properties: { ...(pos ? { position: pos } : {}), via: "Cyprus company registry" },
+          url: `https://companydata.com.cy/companies/${cid}`,
+        });
+        entities.push(oent);
+        links.push({ from: compEnt.id, to: oent.id, label: pos ? `officer (${pos})` : "officer" });
+      }
+    }
+    return { entities, links, note: `${entities.length} registry hits` };
+  }
+));
+
   // ---------- company → manufacturers (SUDOKN / NSF Open Knowledge Network) ----------
   defs.push(await safeRun(
     {
