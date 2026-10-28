@@ -331,7 +331,7 @@ const server = Bun.serve({
         return json({ types: ENTITY_TYPES });
       if (path === "/api/transforms" && method === "GET") {
         const ts = await getTransforms();
-        return json({ transforms: ts.map((t) => ({
+        return json({ transforms: ts.filter((t) => !t.disabled).map((t) => ({
           key: t.key, label: t.label, description: t.description,
           inputTypes: t.inputTypes, needsKey: !!t.needsKey,
         })) });
@@ -369,6 +369,7 @@ const server = Bun.serve({
             const b = await readBody(req);
             const t = await findTransform(String(b.transformKey || ""));
             if (!t) return json({ error: "unknown transform" }, 404);
+            if (t.disabled) return json({ error: `transform temporarily disabled: ${t.disabled}` }, 400);
             const inv = fullInvestigation(row);
             const target = inv.entities.find((x: Entity) => x.id === String(b.entityId || ""));
             if (!target) return json({ error: "entity not in investigation" }, 404);

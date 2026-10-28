@@ -37,7 +37,8 @@ test("entity-types + transforms endpoints", async () => {
   const t = await api("/api/entity-types");
   expect(Object.keys(t.types).length).toBe(12);
   const tr = await api("/api/transforms");
-  expect(tr.transforms.length).toBe(18);
+  expect(tr.transforms.length).toBe(17); // 18 registered, company-cyprus disabled
+  expect(tr.transforms.map((x: any) => x.key)).not.toContain("company-cyprus");
   expect(tr.transforms.every((x: any) => x.key && x.label && x.inputTypes)).toBe(true);
 });
 
@@ -98,5 +99,22 @@ test("transform: unknown key → 404, wrong entity type → 400", async () => {
     });
     expect("should have thrown").toBe("did not throw");
   } catch (e: any) { expect(e.message).toContain("400"); }
+  await api(`/api/investigations/${id}`, { method: "DELETE" });
+});
+
+test("transform: disabled company-cyprus → 400, endpoint never hit", async () => {
+  const created = await api("/api/investigations", {
+    method: "POST", body: JSON.stringify({ name: "api-test-3", seedValue: "Acme Corporation" }),
+  });
+  const id = created.investigation.id;
+  try {
+    await api(`/api/investigations/${id}/transform`, {
+      method: "POST", body: JSON.stringify({ entityId: "company:acme-corporation", transformKey: "company-cyprus" }),
+    });
+    expect("should have thrown").toBe("did not throw");
+  } catch (e: any) {
+    expect(e.message).toContain("400");
+    expect(e.message).toContain("temporarily disabled");
+  }
   await api(`/api/investigations/${id}`, { method: "DELETE" });
 });

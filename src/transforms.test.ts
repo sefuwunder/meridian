@@ -88,6 +88,21 @@ test("findTransform: known and unknown keys", async () => {
   expect(await findTransform("nope")).toBeUndefined();
 });
 
+test("company-cyprus: temporarily disabled, not offered, code intact", async () => {
+  // Registry still holds it (re-enable = drop one field), but no surface
+  // offers it and no run can reach the dead endpoint.
+  const all = await getTransforms();
+  expect(all.length).toBe(18);
+  const cy = all.find((t) => t.key === "company-cyprus")!;
+  expect(cy.disabled).toMatch(/HTTP 404 since 2026-10-26/);
+  expect(cy.inputTypes).toContain("company");
+  expect(typeof cy.run).toBe("function");
+  const offered = await transformsFor("company");
+  expect(offered.map((t) => t.key)).not.toContain("company-cyprus");
+  expect(offered.length).toBeGreaterThan(0); // company still has live transforms
+  expect((await findTransform("company-cyprus"))?.disabled).toBeTruthy();
+});
+
 // ---------- transform runs (fetch stubbed) ----------
 
 const realFetch = globalThis.fetch;

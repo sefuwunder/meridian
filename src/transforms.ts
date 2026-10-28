@@ -59,6 +59,8 @@ export interface TransformDef {
   description: string;
   inputTypes: EntityType[];
   needsKey?: string;                 // key id from keys.ts, when required
+  disabled?: string;                 // reason: offered nowhere, run refused;
+                                     // code stays intact so re-enable is one field
   run: (e: Entity, keys: Record<string, string>) => Promise<TransformResult>;
 }
 
@@ -597,8 +599,11 @@ async function buildTransforms(): Promise<TransformDef[]> {
 
   // CompanyData.com.cy — keyless JSON API over the Cyprus Registrar of Companies
   // (data.gov.cy open-data export, DRCOR, CC BY 4.0). Verified live 2026-10-22.
-  // Greek status/position strings mapped where known; unknown values pass
-  // through raw so new registry values never break the run.
+  // DISABLED 2026-10-28: endpoint withdrawn (HTTP 404 since 2026-10-26,
+  // re-checked 2026-10-28); code intact, re-enable by dropping the field
+  // once companydata.com.cy/api/search recovers. Greek status/position
+  // strings mapped where known; unknown values pass through raw so new
+  // registry values never break the run.
 const CDCY_STATUS_EN: Record<string, string> = {
   "Εγγεγραμμένη": "registered",
   "Διαγραμμένη": "struck off",
@@ -618,6 +623,7 @@ defs.push(await safeRun(
     key: "company-cyprus", label: "Cyprus registry · CompanyData.com.cy",
     description: "Cyprus Registrar of Companies via CompanyData.com.cy: registered-office address, officers, status. Keyless, official open data.",
     inputTypes: ["company"],
+    disabled: "Upstream endpoint withdrawn (HTTP 404 since 2026-10-26); re-enable when companydata.com.cy/api/search recovers.",
   },
   async (e) => {
     const s = await fetchJson(
@@ -1051,7 +1057,7 @@ export async function getTransforms(): Promise<TransformDef[]> {
 }
 
 export async function transformsFor(type: EntityType): Promise<TransformDef[]> {
-  return (await getTransforms()).filter((t) => t.inputTypes.includes(type));
+  return (await getTransforms()).filter((t) => t.inputTypes.includes(type) && !t.disabled);
 }
 
 export async function findTransform(key: string): Promise<TransformDef | undefined> {
