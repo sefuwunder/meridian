@@ -58,6 +58,14 @@ export interface TransformDef {
   label: string;
   description: string;
   inputTypes: EntityType[];
+  // Business-data classification (mirrors SOURCE_DEFS.business in sources.ts):
+  // true when the transform emits business entities — companies, legal
+  // entities, organizations, filings, registries, business places. False
+  // for infrastructure, research, personal, and general-web transforms.
+  // Every transform must carry an explicit value; the registry test fails
+  // any future transform that omits it, so Milton business-only recon
+  // never silently gains a non-business source.
+  business?: boolean;
   needsKey?: string;                 // key id from keys.ts, when required
   disabled?: string;                 // reason: offered nowhere, run refused;
                                      // code stays intact so re-enable is one field
@@ -134,6 +142,7 @@ async function buildTransforms(): Promise<TransformDef[]> {
       key: "cert-subdomains", label: "Subdomains · Cert Spotter",
       description: "Certificate-transparency issuances for this domain and its subdomains",
       inputTypes: ["domain"],
+      business: false,
     },
     async (e) => {
       const domain = e.value.toLowerCase();
@@ -173,6 +182,7 @@ async function buildTransforms(): Promise<TransformDef[]> {
       key: "dns-history", label: "Passive DNS · mnemonic",
       description: "Historical A/AAAA/CNAME answers observed for this domain",
       inputTypes: ["domain"],
+      business: false,
     },
     async (e) => {
       const domain = e.value.toLowerCase();
@@ -223,6 +233,7 @@ async function buildTransforms(): Promise<TransformDef[]> {
       key: "domain-scans", label: "Web scans · urlscan.io",
       description: "Recent urlscan.io scans touching this domain",
       inputTypes: ["domain"],
+      business: false,
     },
     async (e) => {
       const domain = e.value.toLowerCase();
@@ -264,6 +275,7 @@ async function buildTransforms(): Promise<TransformDef[]> {
       key: "ip-ports", label: "Ports & vulns · Shodan InternetDB",
       description: "Open ports, hostnames, known CVEs and tags for this IP",
       inputTypes: ["ip"],
+      business: false,
     },
     async (e) => {
       const j = await fetchJson(`https://internetdb.shodan.io/${encodeURIComponent(e.value)}`, {}, 15000);
@@ -292,6 +304,7 @@ async function buildTransforms(): Promise<TransformDef[]> {
       key: "ip-intel", label: "IP intel · IPQuery",
       description: "ASN, geolocation and risk signals for this IP",
       inputTypes: ["ip"],
+      business: false,
     },
     async (e) => {
       const j = await fetchJson(`https://api.ipquery.io/${encodeURIComponent(e.value)}?format=json`, {}, 15000);
@@ -331,6 +344,7 @@ async function buildTransforms(): Promise<TransformDef[]> {
       key: "ip-risk", label: "IP risk \u00b7 IP99",
       description: "Time-decaying risk verdict with evidence taxonomy for this IP (proxy/vpn/hijacked signals). Point-in-time \u2014 re-run for a fresh verdict.",
       inputTypes: ["ip"],
+      business: false,
     },
     async (e) => {
       let j: any;
@@ -393,6 +407,7 @@ async function buildTransforms(): Promise<TransformDef[]> {
       key: "domain-footprint", label: "DNS + certs \u00b7 IP99",
       description: "Passive DNS, certificate-transparency certs, and same-cert sibling domains for this domain",
       inputTypes: ["domain"],
+      business: false,
     },
     async (e) => {
       const domain = e.value.toLowerCase();
@@ -492,6 +507,7 @@ async function buildTransforms(): Promise<TransformDef[]> {
       key: "company-gleif", label: "Legal entities · GLEIF",
       description: "Search the global LEI registry by company name, with parent links",
       inputTypes: ["company"],
+      business: true,
     },
     async (e) => {
       const j = await fetchJson(
@@ -537,6 +553,7 @@ async function buildTransforms(): Promise<TransformDef[]> {
       key: "company-findall", label: "Company profile · Parallel FindAll",
       description: "AI-extracted company profile: description, website, size",
       inputTypes: ["company"],
+      business: true,
       needsKey: "parallel",
     },
     async (e, keys) => {
@@ -572,6 +589,7 @@ async function buildTransforms(): Promise<TransformDef[]> {
       key: "company-sec", label: "SEC filings · EDGAR",
       description: "SEC EDGAR filer match for this company name",
       inputTypes: ["company"],
+      business: true,
     },
     async (e) => {
       const j = await fetchJson(
@@ -623,6 +641,7 @@ defs.push(await safeRun(
     key: "company-cyprus", label: "Cyprus registry · CompanyData.com.cy",
     description: "Cyprus Registrar of Companies via CompanyData.com.cy: registered-office address, officers, status. Keyless, official open data.",
     inputTypes: ["company"],
+      business: true,
     disabled: "Upstream endpoint withdrawn (HTTP 404 since 2026-10-26); re-enable when companydata.com.cy/api/search recovers.",
   },
   async (e) => {
@@ -703,6 +722,7 @@ defs.push(await safeRun(
       key: "company-sudokn", label: "Manufacturers · SUDOKN",
       description: "US small/medium manufacturers: street addresses, geo, NAICS, certifications, capabilities",
       inputTypes: ["company"],
+      business: true,
     },
     async (e) => {
       const NS = "http://asu.edu/semantics/SUDOKN/";
@@ -802,12 +822,128 @@ defs.push(await safeRun(
     }
   ));
 
+  // ---------- company → trade registers (TradeRegister.fi / Coragrid) ----------
+  // Keyless JSON API over 62 connected trade registers (traderegister.fi).
+  // Verified live 2026-11-05: search + profile return real records;
+  // officers endpoint returns the documented OfficerPage shape (empty
+  // data[] for the companies sampled — officers are sparse in the free
+  // tier, so the mapping is defensive and an empty list is a normal hit).
+  // API Terms (2026:1), Oct 2026: free use in internal business
+  // operations and own products, provided company data is shown as
+  // "Powered by Coragrid" wherever displayed; 60/min per client address
+  // (429 + Retry-After); no bulk copying to build a competing service or
+  // redistribute as a dataset, no AI training, no presenting records as
+  // official extracts. This transform is per-company on-demand only, shows
+  // the attribution on every entity, and never claims a street address
+  // (the API carries region-level geography only).
+  const TR_ORG_RE = /\b(ltd|limited|llc|inc|corp|services|holdings|partners|trust|plc|sarl|gmbh|oy|ab|as|bv|nv|sa|ag)\b/i;
+  defs.push(await safeRun(
+    {
+      key: "company-traderegister", label: "Trade register · TradeRegister.fi",
+      description: "Trade registers in 62 countries via TradeRegister.fi (Coragrid): status, legal form, identifiers, industry, current officers. Keyless, attribution: Powered by Coragrid.",
+      inputTypes: ["company"],
+      business: true,
+    },
+    async (e) => {
+      const q = e.value.trim().slice(0, 64);
+      if (q.length < 3)
+        return { entities: [], links: [], note: "company name too short for trade register search (min 3 characters)" };
+      let s: any;
+      try {
+        s = await fetchJson(
+          `https://api.traderegister.fi/v1/search?q=${encodeURIComponent(q)}&limit=5`, {}, 25000);
+      } catch (err: any) {
+        if (/HTTP 429/.test(String(err?.message || ""))) {
+          return { entities: [], links: [], note: "TradeRegister.fi rate limit (60/min) — retry shortly" };
+        }
+        throw err;
+      }
+      const results = Array.isArray(s?.data) ? s.data : [];
+      if (!results.length) return { entities: [], links: [], note: "no trade register matches" };
+      const entities: Entity[] = [], links: Elink[] = [];
+      const seenCompanies = new Set<string>();
+      const seenOfficers = new Set<string>();
+      let companyCount = 0, officerCount = 0;
+      for (const r of results.slice(0, 5)) {
+        const id = String(r?.id || "").trim();
+        const name = String(r?.name || "").slice(0, 90);
+        if (!id || !name || seenCompanies.has(id)) continue;
+        seenCompanies.add(id);
+        // Detail is best-effort: the search row alone is still a useful hit.
+        let d: any = null;
+        try {
+          d = await fetchJson(`https://api.traderegister.fi/v1/companies/${encodeURIComponent(id)}`, {}, 25000);
+          if (d?.data) d = d.data;
+          else if (d && typeof d === "object" && d.object !== "company") d = null;
+        } catch { /* fall through with the search row */ }
+        const rec = d && typeof d === "object" ? d : r;
+        const status = String(rec?.lifecycle?.status || rec?.company_status || "").trim();
+        const legalForm = String(rec?.legal_form || "").trim();
+        const country = String(rec?.country_code || "").trim();
+        const industry = String(rec?.industry || "").trim();
+        const asOf = String(rec?.as_of_date || "").slice(0, 10);
+        const regId = (Array.isArray(rec?.identifiers) ? rec.identifiers : [])
+          .map((x: any) => String(x?.value || "").trim()).find(Boolean) || "";
+        const canonical = String(rec?.lifecycle?.canonical_id || "").trim();
+        const props: Record<string, string> = {
+          ...(status ? { status } : {}),
+          ...(legalForm ? { legal_form: legalForm } : {}),
+          ...(country ? { country } : {}),
+          ...(regId ? { registry_id: regId } : {}),
+          ...(industry ? { industry } : {}),
+          ...(asOf ? { registry_data_as_of: asOf } : {}),
+          ...(canonical && canonical !== id ? { canonical_id: canonical } : {}),
+          via: "TradeRegister.fi (Powered by Coragrid)",
+        };
+        const compEnt = mkEntity("company", name, "traderegister", {
+          properties: props,
+          url: `https://api.traderegister.fi/v1/companies/${encodeURIComponent(id)}`,
+        });
+        entities.push(compEnt);
+        links.push({ from: e.id, to: compEnt.id, label: "registered as" });
+        companyCount++;
+        // Officers are best-effort: a failed fetch means "no officers shown".
+        let officers: any[] = [];
+        try {
+          const o = await fetchJson(`https://api.traderegister.fi/v1/companies/${encodeURIComponent(id)}/officers`, {}, 25000);
+          officers = Array.isArray(o?.data) ? o.data : [];
+        } catch { /* no officers shown */ }
+        for (const o of officers.slice(0, 10)) {
+          const oname = String(o?.name || "").slice(0, 90);
+          if (!oname || seenOfficers.has(oname.toLowerCase())) continue;
+          seenOfficers.add(oname.toLowerCase());
+          const roles = (Array.isArray(o?.roles) ? o.roles : []).map((x: any) => String(x)).filter(Boolean);
+          const appointed = String(o?.appointed_on || "").slice(0, 10);
+          const resigned = String(o?.resigned_on || "").slice(0, 10);
+          const src = (o?.source && typeof o.source === "object") ? o.source : {};
+          const otype: EntityType = TR_ORG_RE.test(oname) ? "company" : "person";
+          const oent = mkEntity(otype, oname, "traderegister", {
+            properties: {
+              ...(roles.length ? { roles: roles.slice(0, 4).join(", ").slice(0, 120) } : {}),
+              ...(appointed ? { appointed_on: appointed } : {}),
+              ...(resigned ? { resigned_on: resigned } : {}),
+              ...(src.system ? { officer_source: String(src.system).slice(0, 60) } : {}),
+              ...(src.observed_at ? { observed_at: String(src.observed_at).slice(0, 25) } : {}),
+              via: "TradeRegister.fi (Powered by Coragrid)",
+            },
+            url: `https://api.traderegister.fi/v1/companies/${encodeURIComponent(id)}`,
+          });
+          entities.push(oent);
+          links.push({ from: compEnt.id, to: oent.id, label: roles[0] ? `officer (${roles[0].slice(0, 40)})` : "officer" });
+          officerCount++;
+        }
+      }
+      return { entities, links, note: `${companyCount} companies, ${officerCount} officers` };
+    }
+  ));
+
   // ---------- person → papers (OpenAlex) ----------
   defs.push(await safeRun(
     {
       key: "person-papers", label: "Research · OpenAlex",
       description: "Papers and affiliations for this researcher",
       inputTypes: ["person"],
+      business: false,
     },
     async (e) => {
       const j = await fetchJson(
@@ -850,6 +986,7 @@ defs.push(await safeRun(
       key: "person-donations", label: "Donations · OpenFEC",
       description: "US campaign-finance donations by donor name",
       inputTypes: ["person"],
+      business: false,
     },
     async (e) => {
       const j = await fetchJson(
@@ -880,6 +1017,7 @@ defs.push(await safeRun(
       key: "location-places", label: "Nearby places · OpenStreetMap",
       description: "Businesses and amenities around these coordinates",
       inputTypes: ["location"],
+      business: true,
     },
     async (e) => {
       if (e.lat == null || e.lon == null)
@@ -914,6 +1052,7 @@ defs.push(await safeRun(
       key: "location-aircraft", label: "Aircraft overhead · adsb.lol",
       description: "Live ADS-B aircraft within 25 nautical miles",
       inputTypes: ["location"],
+      business: false,
     },
     async (e) => {
       if (e.lat == null || e.lon == null)
@@ -953,6 +1092,7 @@ defs.push(await safeRun(
       key: "wikimedia-geo", label: "Notable places · Wikimedia",
       description: "QRank-ranked notable places from a local CC0 Wikidata/OSM index (one-time setup, see README)",
       inputTypes: ["location"],
+      business: false,
     },
     async (e) => {
       if (e.lat == null || e.lon == null)
@@ -1018,6 +1158,7 @@ defs.push(await safeRun(
       key: "web-search", label: "Web search · Exa",
       description: "Neural web search for pages about this entity",
       inputTypes: ["domain", "ip", "person", "company", "email", "phone", "location", "url", "netblock", "as", "document"],
+      business: false,
       needsKey: "exa",
     },
     async (e, keys) => {

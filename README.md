@@ -4,9 +4,9 @@ Start from any entity — a domain, an IP, a company name, a person — and grow
 an investigation graph by running **transforms**. Each transform takes one
 entity and fans out into new entities connected by labeled links, Maltego-style.
 
-`meridian` ships **17 transforms** over free and keyless sources (Shodan
+`meridian` ships **18 transforms** over free and keyless sources (Shodan
 InternetDB, Cert Spotter, mnemonic passive DNS, IPQuery, urlscan.io, GLEIF,
-SEC EDGAR, OpenAlex, OpenFEC, OpenStreetMap, adsb.lol) plus two keyed ones
+TradeRegister.fi, SEC EDGAR, OpenAlex, OpenFEC, OpenStreetMap, adsb.lol) plus two keyed ones
 (Exa web search, Parallel FindAll — keys on the Keys screen, never committed).
 A unified **entity search** sits in the top bar: type anything, the type is
 auto-detected (IP, email, phone, URL, domain…), and results drop straight onto

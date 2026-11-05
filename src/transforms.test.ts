@@ -49,9 +49,9 @@ test("detectEntityType: ip, email, phone, url, domain, netblock, fallback", () =
 
 // ---------- transform registry ----------
 
-test("registry: 18 transforms, all well-formed", async () => {
+test("registry: 19 transforms, all well-formed", async () => {
   const ts = await getTransforms();
-  expect(ts.length).toBe(18);
+  expect(ts.length).toBe(19);
   const keys = new Set<string>();
   for (const t of ts) {
     expect(t.key.length).toBeGreaterThan(0);
@@ -83,6 +83,27 @@ test("transformsFor: every entity type except note has at least one transform", 
   }
 });
 
+test("registry: every transform carries an explicit business boolean", async () => {
+  const ts = await getTransforms();
+  for (const t of ts) {
+    expect(typeof t.business, `${t.key} must have an explicit business boolean`).toBe("boolean");
+  }
+});
+
+// Pinned deliberately: reclassifying a transform must update this test as
+// a conscious act, never silently (same pattern as business-scope.test.ts).
+const EXPECTED_BUSINESS_TRANSFORMS = [
+  "company-gleif", "company-findall", "company-sec", "company-cyprus",
+  "company-sudokn", "company-traderegister", "location-places",
+];
+
+test("business transforms are exactly the audited set", async () => {
+  const ts = await getTransforms();
+  const got = ts.filter((t) => t.business).map((t) => t.key).sort();
+  expect(got).toEqual([...EXPECTED_BUSINESS_TRANSFORMS].sort());
+  expect((await findTransform("company-traderegister"))?.business).toBe(true);
+});
+
 test("findTransform: known and unknown keys", async () => {
   expect((await findTransform("ip-intel"))?.label).toMatch(/IPQuery/);
   expect(await findTransform("nope")).toBeUndefined();
@@ -92,7 +113,7 @@ test("company-cyprus: temporarily disabled, not offered, code intact", async () 
   // Registry still holds it (re-enable = drop one field), but no surface
   // offers it and no run can reach the dead endpoint.
   const all = await getTransforms();
-  expect(all.length).toBe(18);
+  expect(all.length).toBe(19);
   const cy = all.find((t) => t.key === "company-cyprus")!;
   expect(cy.disabled).toMatch(/HTTP 404 since 2026-10-26/);
   expect(cy.inputTypes).toContain("company");
@@ -253,6 +274,112 @@ test("company-sudokn: no matches → empty, not failed", async () => {
   const r = await t.run({ id: "company:zz", type: "company", value: "Nonexistent Corp XYZ", label: "x", properties: {}, source: "s" }, {});
   expect(r.entities).toEqual([]);
   expect(r.note).toMatch(/0 SUDOKN/);
+});
+
+// ---------- company-traderegister (fixtures mirror the live API shapes:
+// search page + company envelope from traderegister.fi, Officer objects
+// from its OpenAPI schema; live officers came back empty for every
+// company sampled 2026-11-05, so the officer mapping is schema-verified,
+// not live-verified) ----------
+
+function traderegisterStub(officersFail = false) {
+  return stubFetch((url) => {
+    if (url.includes("/v1/search")) {
+      return {
+        object: "list", query: "Acme", address_countries: [], data: [
+          { id: "co_acme1", object: "company", lifecycle: { status: "active" }, name: "Acme Oy", country_code: "FI", company_status: "active", legal_form: "Osakeyhtiö", industry: "Software", business_model: "Software", operating_geography: "Uusimaa, Finland", as_of_date: "2026-10-22" },
+          { id: "co_acme2", object: "company", lifecycle: { status: "active" }, name: "Acme AB", country_code: "SE", company_status: "active", legal_form: "Aktiebolag", industry: "Retail", as_of_date: "2026-10-20" },
+        ], next_cursor: null, attribution: "Powered by Coragrid",
+      };
+    }
+    if (url.includes("/officers")) {
+      if (officersFail) throw new Error("officers down");
+      if (url.includes("co_acme1")) {
+        return {
+          object: "company_officer_list", requested_company_id: "co_acme1", company_id: "co_acme1", data: [
+            { object: "company_officer", name: "Aino Example", roles: ["Chief Executive Officer"], appointed_on: "2020-03-02", source: { system: "official_company_register", url: "https://example.invalid/register", observed_at: "2026-10-22T08:00:00Z" } },
+            { object: "company_officer", name: "Acme Holdings Ltd", roles: ["Board Member"], source: { system: "official_company_register" } },
+          ], has_more: false, attribution: "Powered by Coragrid",
+        };
+      }
+      return { object: "company_officer_list", requested_company_id: "co_acme2", company_id: "co_acme2", data: [], has_more: false, attribution: "Powered by Coragrid" };
+    }
+    if (url.includes("co_acme1")) {
+      return { data: { id: "co_acme1", object: "company", lifecycle: { status: "active" }, name: "Acme Oy", summary: "Acme Oy", country_code: "FI", company_status: "active", company_type: "private_limited_company", legal_form: "Osakeyhtiö", branch: false, industry: "Software", business_model: "Software", operating_geography: "Uusimaa, Finland", as_of_date: "2026-10-22", identifiers: [{ scheme: "national_registry_number", value: "1234567-8", country_scope: "FI", role: "root", status: "active" }], classifications: [{ scheme: "tol_2025", code: "62010", label: "Computer programming", is_primary: true }] }, attribution: "Powered by Coragrid" };
+    }
+    // co_acme2 profile: bare search-row shape (no data envelope) — exercises the fallback path
+    return { id: "co_acme2", object: "company", lifecycle: { status: "active" }, name: "Acme AB", country_code: "SE", company_status: "active", legal_form: "Aktiebolag", industry: "Retail", as_of_date: "2026-10-20" };
+  });
+}
+
+const traderegisterSeed = { id: "company:acme", type: "company", value: "Acme", label: "Acme", properties: {}, source: "s" } as const;
+
+test("company-traderegister: companies + officers with attribution", async () => {
+  traderegisterStub();
+  const t = (await findTransform("company-traderegister"))!;
+  expect(t.inputTypes).toContain("company");
+  expect(t.business).toBe(true);
+  expect(t.needsKey).toBeUndefined();
+  const r = await t.run({ ...traderegisterSeed }, {});
+  const oy = r.entities.find((e) => e.type === "company" && e.value === "Acme Oy");
+  expect(oy).toBeTruthy();
+  expect(oy?.properties.status).toBe("active");
+  expect(oy?.properties.legal_form).toBe("Osakeyhtiö");
+  expect(oy?.properties.country).toBe("FI");
+  expect(oy?.properties.registry_id).toBe("1234567-8");
+  expect(oy?.properties.industry).toBe("Software");
+  expect(oy?.properties.registry_data_as_of).toBe("2026-10-22");
+  expect(oy?.properties.via).toMatch(/Powered by Coragrid/);
+  expect(oy?.url).toContain("api.traderegister.fi/v1/companies/co_acme1");
+  const ab = r.entities.find((e) => e.type === "company" && e.value === "Acme AB");
+  expect(ab?.properties.country).toBe("SE"); // search-row fallback, no profile envelope
+  const ceo = r.entities.find((e) => e.type === "person" && e.value === "Aino Example");
+  expect(ceo).toBeTruthy();
+  expect(ceo?.properties.roles).toBe("Chief Executive Officer");
+  expect(ceo?.properties.appointed_on).toBe("2020-03-02");
+  expect(ceo?.properties.officer_source).toBe("official_company_register");
+  expect(ceo?.properties.via).toMatch(/Powered by Coragrid/);
+  expect(r.links.find((l) => l.to === ceo!.id)?.label).toBe("officer (Chief Executive Officer)");
+  const holdings = r.entities.find((e) => e.value === "Acme Holdings Ltd");
+  expect(holdings?.type).toBe("company"); // org-like officer name → company entity
+  expect(r.links.find((l) => l.to === oy!.id)?.label).toBe("registered as");
+  expect(r.note).toBe("2 companies, 2 officers");
+});
+
+test("company-traderegister: no matches → empty, not failed", async () => {
+  stubFetch((url) => {
+    expect(url).toContain("/v1/search");
+    return { object: "list", query: "Zzznothing", data: [], next_cursor: null, attribution: "Powered by Coragrid" };
+  });
+  const t = (await findTransform("company-traderegister"))!;
+  const r = await t.run({ ...traderegisterSeed, value: "Zzznothing Corp" }, {});
+  expect(r.entities).toEqual([]);
+  expect(r.note).toMatch(/no trade register matches/);
+});
+
+test("company-traderegister: short query → graceful empty (API needs 3+ chars)", async () => {
+  stubFetch(() => { throw new Error("should not fetch for a short query"); });
+  const t = (await findTransform("company-traderegister"))!;
+  const r = await t.run({ ...traderegisterSeed, value: "AB" }, {});
+  expect(r.entities).toEqual([]);
+  expect(r.note).toMatch(/too short/);
+});
+
+test("company-traderegister: officers endpoint down → companies still returned", async () => {
+  traderegisterStub(true);
+  const t = (await findTransform("company-traderegister"))!;
+  const r = await t.run({ ...traderegisterSeed }, {});
+  expect(r.entities.some((e) => e.type === "company" && e.value === "Acme Oy")).toBe(true);
+  expect(r.entities.filter((e) => e.type === "person").length).toBe(0);
+  expect(r.note).toBe("2 companies, 0 officers");
+});
+
+test("company-traderegister: 429 → rate-limit note, no throw", async () => {
+  (globalThis as any).fetch = async () => ({ ok: false, status: 429, json: async () => ({}) }) as any;
+  const t = (await findTransform("company-traderegister"))!;
+  const r = await t.run({ ...traderegisterSeed }, {});
+  expect(r.entities).toEqual([]);
+  expect(r.note).toMatch(/rate limit/);
 });
 
 test("ip-risk: verdict behind evidence_state, as + location entities", async () => {

@@ -333,7 +333,7 @@ const server = Bun.serve({
         const ts = await getTransforms();
         return json({ transforms: ts.filter((t) => !t.disabled).map((t) => ({
           key: t.key, label: t.label, description: t.description,
-          inputTypes: t.inputTypes, needsKey: !!t.needsKey,
+          inputTypes: t.inputTypes, needsKey: !!t.needsKey, business: !!t.business,
         })) });
       }
       {
