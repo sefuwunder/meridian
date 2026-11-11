@@ -937,6 +937,175 @@ defs.push(await safeRun(
     }
   ));
 
+  // ---------- company → Open Company Graph (locaihost) ----------
+  // Keyless JSON API joining 19 official open company registries
+  // (graph.locaihost.org). Verified live 2026-11-11: search, company
+  // detail and domain lookup all return 200 with no key; the Equinor
+  // sample shows status, legal form, LEI, industry codes, employees, and
+  // a domains[] list with per-domain confidence + evidence method.
+  // "The API answers without a key at a modest rate limit. A key raises
+  // the limit." (launch post, dev.to, 2026-11-05). No people data by
+  // design — organisations only, directors/officers dropped at load.
+  // Geography is town/postcode-level only: no street-address field
+  // exists, so none is claimed. Monthly rebuild, not real-time; only
+  // ~0.4% of orgs have a confirmed website, so the domain pivot fires
+  // for that slice. Per-record source + licence kept.
+  const OCG_BASE = "https://graph.locaihost.org";
+  const OCG_VIA = "Open Company Graph (graph.locaihost.org)";
+  function ocgProps(rec: any): Record<string, string> {
+    const status = String(rec?.status || "").trim();
+    const legalForm = String(rec?.legal_form || "").trim();
+    const country = String(rec?.country || "").trim();
+    const city = String(rec?.city || "").trim();
+    const postcode = String(rec?.postcode || "").trim();
+    const lei = String(rec?.lei || "").trim();
+    const incorporated = String(rec?.incorporated || "").slice(0, 10);
+    const number = String(rec?.number || "").trim();
+    const ind = rec?.industry && typeof rec.industry === "object" ? rec.industry : null;
+    const indCodes = (Array.isArray(ind?.codes) ? ind.codes : []).map((c: any) => String(c)).filter(Boolean).slice(0, 3);
+    const indText = String(ind?.text || "").trim();
+    const industry = ind ? [indCodes.join(", "), indText].filter(Boolean).join(" — ").slice(0, 120) : "";
+    const employees = Number.isFinite(Number(rec?.employees)) ? String(Number(rec.employees)) : "";
+    return {
+      ...(status ? { status } : {}),
+      ...(legalForm ? { legal_form: legalForm } : {}),
+      ...(country ? { country } : {}),
+      ...(city ? { city } : {}),
+      ...(postcode ? { postcode } : {}),
+      ...(number ? { registry_id: number } : {}),
+      ...(lei ? { lei } : {}),
+      ...(incorporated ? { incorporated } : {}),
+      ...(industry ? { industry } : {}),
+      ...(employees ? { employees } : {}),
+      via: OCG_VIA,
+    };
+  }
+  function ocgCompanyEnt(name: string, rec: any, extraProps: Record<string, string> = {}): Entity {
+    const pageUrl = String(rec?.url || "").trim();
+    const recordUrl = rec?.source && typeof rec.source === "object" ? String(rec.source.record_url || "") : "";
+    return mkEntity("company", name, "opencograph", {
+      properties: { ...ocgProps(rec), ...extraProps },
+      url: recordUrl || pageUrl || undefined,
+    });
+  }
+  async function ocgDetail(id: string): Promise<any | null> {
+    try {
+      const d = await fetchJson(`${OCG_BASE}/api/v1/company/${encodeURIComponent(id)}`, {}, 25000);
+      return d && typeof d === "object" && !Array.isArray(d) ? d : null;
+    } catch { return null; }
+  }
+  defs.push(await safeRun(
+    {
+      key: "company-opencograph", label: "Company graph · Open Company Graph",
+      description: "19 open company registries joined (Open Company Graph, locaihost): status, legal form, LEI, industry, employees, confirmed websites. Keyless.",
+      inputTypes: ["company"],
+      business: true,
+    },
+    async (e) => {
+      const q = e.value.trim().slice(0, 64);
+      if (q.length < 3)
+        return { entities: [], links: [], note: "company name too short for Open Company Graph search (min 3 characters)" };
+      let s: any;
+      try {
+        s = await fetchJson(
+          `${OCG_BASE}/api/v1/search?q=${encodeURIComponent(q)}&limit=5`, {}, 25000);
+      } catch (err: any) {
+        if (/HTTP 429/.test(String(err?.message || ""))) {
+          return { entities: [], links: [], note: "Open Company Graph rate limit — retry shortly" };
+        }
+        throw err;
+      }
+      const results = Array.isArray(s?.results) ? s.results : [];
+      if (!results.length) return { entities: [], links: [], note: "no Open Company Graph matches" };
+      const entities: Entity[] = [], links: Elink[] = [];
+      const seenCompanies = new Set<string>();
+      const seenDomains = new Set<string>();
+      let companyCount = 0, domainCount = 0;
+      for (const r of results.slice(0, 5)) {
+        const id = String(r?.id || "").trim();
+        const name = String(r?.name || "").slice(0, 90);
+        if (!id || !name || seenCompanies.has(id)) continue;
+        seenCompanies.add(id);
+        // Detail is best-effort: the search row alone is still a useful hit.
+        const d = await ocgDetail(id);
+        const rec = d || r;
+        const compEnt = ocgCompanyEnt(name, rec);
+        entities.push(compEnt);
+        links.push({ from: e.id, to: compEnt.id, label: "registered as" });
+        companyCount++;
+        // Confirmed websites come from the detail record only.
+        const domains = Array.isArray(d?.domains) ? d.domains : [];
+        for (const dom of domains.slice(0, 5)) {
+          const host = String(dom?.domain || "").trim().toLowerCase();
+          if (!host || seenDomains.has(host)) continue;
+          seenDomains.add(host);
+          const conf = Number(dom?.confidence);
+          const methods = (Array.isArray(dom?.evidence) ? dom.evidence : [])
+            .map((x: any) => String(x?.method || "")).filter(Boolean);
+          const dent = mkEntity("domain", host, "opencograph", {
+            properties: {
+              ...(Number.isFinite(conf) ? { confidence: String(conf) } : {}),
+              ...(methods.length ? { website_evidence: methods.slice(0, 2).join(", ").slice(0, 80) } : {}),
+              via: OCG_VIA,
+            },
+            url: `https://${host}`,
+          });
+          entities.push(dent);
+          links.push({ from: compEnt.id, to: dent.id, label: "website" });
+          domainCount++;
+        }
+      }
+      return { entities, links, note: `${companyCount} companies, ${domainCount} websites` };
+    }
+  ));
+
+  // ---------- domain → companies behind it (Open Company Graph) ----------
+  defs.push(await safeRun(
+    {
+      key: "domain-opencograph", label: "Companies behind domain · Open Company Graph",
+      description: "Companies behind a domain via Open Company Graph (locaihost): registry matches with confidence + evidence method. Keyless. Only fires for the ~205K companies with a confirmed website.",
+      inputTypes: ["domain"],
+      business: true,
+    },
+    async (e) => {
+      const host = e.value.trim().toLowerCase().replace(/^https?:\/\//, "").split("/")[0].slice(0, 128);
+      if (host.length < 4 || !host.includes("."))
+        return { entities: [], links: [], note: "not a domain (need a host like example.com)" };
+      let s: any;
+      try {
+        s = await fetchJson(`${OCG_BASE}/api/v1/domain?domain=${encodeURIComponent(host)}`, {}, 25000);
+      } catch (err: any) {
+        if (/HTTP 429/.test(String(err?.message || ""))) {
+          return { entities: [], links: [], note: "Open Company Graph rate limit — retry shortly" };
+        }
+        throw err;
+      }
+      const results = Array.isArray(s?.results) ? s.results : [];
+      if (!results.length) return { entities: [], links: [], note: "no companies behind this domain in Open Company Graph" };
+      const entities: Entity[] = [], links: Elink[] = [];
+      const seen = new Set<string>();
+      let n = 0;
+      for (const r of results.slice(0, 5)) {
+        const id = String(r?.id || "").trim();
+        const name = String(r?.name || "").slice(0, 90);
+        if (!id || !name || seen.has(id)) continue;
+        seen.add(id);
+        // Detail is best-effort: the domain row alone is still a useful hit.
+        const d = await ocgDetail(id);
+        const rec = d || r;
+        const conf = Number(r?.confidence);
+        const ent = ocgCompanyEnt(name, rec, {
+          ...(Number.isFinite(conf) ? { domain_confidence: String(conf) } : {}),
+          ...(String(r?.method || "").trim() ? { website_evidence: String(r.method).trim().slice(0, 80) } : {}),
+        });
+        entities.push(ent);
+        links.push({ from: e.id, to: ent.id, label: "owned by" });
+        n++;
+      }
+      return { entities, links, note: `${n} companies behind this domain` };
+    }
+  ));
+
   // ---------- person → papers (OpenAlex) ----------
   defs.push(await safeRun(
     {

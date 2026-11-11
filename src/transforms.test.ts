@@ -49,9 +49,9 @@ test("detectEntityType: ip, email, phone, url, domain, netblock, fallback", () =
 
 // ---------- transform registry ----------
 
-test("registry: 19 transforms, all well-formed", async () => {
+test("registry: 21 transforms, all well-formed", async () => {
   const ts = await getTransforms();
-  expect(ts.length).toBe(19);
+  expect(ts.length).toBe(21);
   const keys = new Set<string>();
   for (const t of ts) {
     expect(t.key.length).toBeGreaterThan(0);
@@ -64,13 +64,14 @@ test("registry: 19 transforms, all well-formed", async () => {
   }
 });
 
-test("transformsFor: domain gets 5 transforms incl. web-search", async () => {
+test("transformsFor: domain gets 6 transforms incl. web-search", async () => {
   const ts = await transformsFor("domain");
   const keys = ts.map((t) => t.key);
   expect(keys).toContain("cert-subdomains");
   expect(keys).toContain("dns-history");
   expect(keys).toContain("domain-scans");
   expect(keys).toContain("domain-footprint");
+  expect(keys).toContain("domain-opencograph");
   expect(keys).toContain("web-search");
   expect(keys).not.toContain("ip-ports");
 });
@@ -94,7 +95,8 @@ test("registry: every transform carries an explicit business boolean", async () 
 // a conscious act, never silently (same pattern as business-scope.test.ts).
 const EXPECTED_BUSINESS_TRANSFORMS = [
   "company-gleif", "company-findall", "company-sec", "company-cyprus",
-  "company-sudokn", "company-traderegister", "location-places",
+  "company-sudokn", "company-traderegister", "company-opencograph",
+  "domain-opencograph", "location-places",
 ];
 
 test("business transforms are exactly the audited set", async () => {
@@ -113,7 +115,7 @@ test("company-cyprus: temporarily disabled, not offered, code intact", async () 
   // Registry still holds it (re-enable = drop one field), but no surface
   // offers it and no run can reach the dead endpoint.
   const all = await getTransforms();
-  expect(all.length).toBe(19);
+  expect(all.length).toBe(21);
   const cy = all.find((t) => t.key === "company-cyprus")!;
   expect(cy.disabled).toMatch(/HTTP 404 since 2026-10-26/);
   expect(cy.inputTypes).toContain("company");
@@ -380,6 +382,164 @@ test("company-traderegister: 429 → rate-limit note, no throw", async () => {
   const r = await t.run({ ...traderegisterSeed }, {});
   expect(r.entities).toEqual([]);
   expect(r.note).toMatch(/rate limit/);
+});
+
+// ---------- company-opencograph + domain-opencograph (fixtures mirror the
+// live API shapes verified 2026-11-11: search results, company detail with
+// domains[] + source/licence, domain lookup results) ----------
+
+function ocgStub(detailFail: "none" | "gb" | "all" = "gb") {
+  return stubFetch((url) => {
+    if (url.includes("/api/v1/search")) {
+      return {
+        query: "Acme", country: null, limit: 5, count: 2, results: [
+          { id: "NO-ORG-123456789", name: "ACME ASA", country: "NO", city: "OSLO", status: "Active", url: "https://graph.locaihost.org/c/no/NO-ORG-123456789-acme-asa", indexed: true },
+          { id: "GB-COH-00012345", name: "ACME LTD", country: "GB", city: "LONDON", status: "Active", url: "https://graph.locaihost.org/c/gb/GB-COH-00012345-acme-ltd", indexed: true },
+        ],
+      };
+    }
+    if (url.includes("/api/v1/domain")) {
+      return {
+        domain: "acme.com", results: [
+          { id: "NO-ORG-123456789", name: "ACME ASA", country: "NO", status: "Active", confidence: 0.97, method: "registry-stated-website" },
+          { id: "GB-COH-00012345", name: "ACME LTD", country: "GB", status: "Active", confidence: 0.9, method: "wikidata-official-website" },
+        ],
+      };
+    }
+    if (url.includes("/api/v1/company/NO-ORG-123456789")) {
+      if (detailFail === "all") throw new Error("detail down");
+      return {
+        id: "NO-ORG-123456789", name: "ACME ASA", scheme: "NO-ORG", number: "123456789", country: "NO",
+        city: "OSLO", postcode: "0150", status: "Active", legal_form: "ASA", incorporated: "1980-01-15",
+        industry: { system: "SN2007 (NACE)", codes: ["06.100"], text: "Utvinning av råolje" },
+        previous_name: null, lei: "OW6OFBNCKXC4US5C7523",
+        registry_ids: [{ id: "LEI-OW6OFBNCKXC4US5C7523", scheme: "LEI", number: "OW6OFBNCKXC4US5C7523", method: "gleif-registration-authority", confidence: 0.99 }],
+        domains: [
+          { domain: "acme.com", confidence: 0.97, evidence: [{ method: "registry-stated-website", confidence: 0.97, page: null, note: "Brønnøysund register: hjemmeside" }, { method: "wikidata-official-website", confidence: 0.9, page: "https://www.wikidata.org/wiki/Q1", note: null, wikidata: "Q1" }] },
+          { domain: "acme.no", confidence: 0.9, evidence: [{ method: "wikidata-official-website", confidence: 0.9, page: "https://www.wikidata.org/wiki/Q1", note: null, wikidata: "Q1" }] },
+        ],
+        employees: 1200,
+        source: { name: "no-brreg", registry: "Brønnøysund Register Centre (Enhetsregisteret)", licence: "Norwegian Licence for Open Government Data (NLOD) 2.0", licence_url: "https://data.norge.no/nlod/en/2.0", record_url: "https://virksomhet.brreg.no/nb/oppslag/enheter/123456789" },
+        url: "https://graph.locaihost.org/c/no/NO-ORG-123456789-acme-asa",
+      };
+    }
+    // GB detail fails in the default stub — exercises the search-row fallback.
+    throw new Error("detail down");
+  });
+}
+
+const ocgCompanySeed = { id: "company:acme", type: "company", value: "Acme", label: "Acme", properties: {}, source: "s" } as const;
+const ocgDomainSeed = { id: "domain:acme-com", type: "domain", value: "acme.com", label: "acme.com", properties: {}, source: "s" } as const;
+
+test("company-opencograph: companies + websites with attribution", async () => {
+  ocgStub();
+  const t = (await findTransform("company-opencograph"))!;
+  expect(t.inputTypes).toContain("company");
+  expect(t.business).toBe(true);
+  expect(t.needsKey).toBeUndefined();
+  const r = await t.run({ ...ocgCompanySeed }, {});
+  const asa = r.entities.find((e) => e.type === "company" && e.value === "ACME ASA");
+  expect(asa).toBeTruthy();
+  expect(asa?.properties.status).toBe("Active");
+  expect(asa?.properties.legal_form).toBe("ASA");
+  expect(asa?.properties.country).toBe("NO");
+  expect(asa?.properties.city).toBe("OSLO");
+  expect(asa?.properties.postcode).toBe("0150");
+  expect(asa?.properties.lei).toBe("OW6OFBNCKXC4US5C7523");
+  expect(asa?.properties.registry_id).toBe("123456789");
+  expect(asa?.properties.industry).toBe("06.100 — Utvinning av råolje");
+  expect(asa?.properties.incorporated).toBe("1980-01-15");
+  expect(asa?.properties.employees).toBe("1200");
+  expect(asa?.properties.via).toMatch(/Open Company Graph/);
+  expect(asa?.url).toContain("virksomhet.brreg.no"); // registry record wins over graph page
+  const ltd = r.entities.find((e) => e.type === "company" && e.value === "ACME LTD");
+  expect(ltd?.properties.country).toBe("GB"); // search-row fallback, no detail
+  expect(ltd?.url).toContain("graph.locaihost.org/c/gb/");
+  const site = r.entities.find((e) => e.type === "domain" && e.value === "acme.com");
+  expect(site).toBeTruthy();
+  expect(site?.properties.confidence).toBe("0.97");
+  expect(site?.properties.website_evidence).toMatch(/registry-stated-website/);
+  expect(site?.properties.via).toMatch(/Open Company Graph/);
+  expect(site?.url).toBe("https://acme.com");
+  expect(r.links.find((l) => l.to === asa!.id)?.label).toBe("registered as");
+  expect(r.links.find((l) => l.to === site!.id)?.label).toBe("website");
+  expect(r.note).toBe("2 companies, 2 websites");
+});
+
+test("company-opencograph: no matches → empty, not failed", async () => {
+  stubFetch((url) => {
+    expect(url).toContain("/api/v1/search");
+    return { query: "Zzznothing", country: null, limit: 5, count: 0, results: [] };
+  });
+  const t = (await findTransform("company-opencograph"))!;
+  const r = await t.run({ ...ocgCompanySeed, value: "Zzznothing Corp" }, {});
+  expect(r.entities).toEqual([]);
+  expect(r.note).toMatch(/no Open Company Graph matches/);
+});
+
+test("company-opencograph: short query → graceful empty (API needs 3+ chars)", async () => {
+  stubFetch(() => { throw new Error("should not fetch for a short query"); });
+  const t = (await findTransform("company-opencograph"))!;
+  const r = await t.run({ ...ocgCompanySeed, value: "AB" }, {});
+  expect(r.entities).toEqual([]);
+  expect(r.note).toMatch(/too short/);
+});
+
+test("company-opencograph: detail down → companies still returned, no websites", async () => {
+  ocgStub("all");
+  const t = (await findTransform("company-opencograph"))!;
+  const r = await t.run({ ...ocgCompanySeed }, {});
+  expect(r.entities.some((e) => e.type === "company" && e.value === "ACME ASA")).toBe(true);
+  expect(r.entities.filter((e) => e.type === "domain").length).toBe(0);
+  expect(r.note).toBe("2 companies, 0 websites");
+});
+
+test("company-opencograph: 429 → rate-limit note, no throw", async () => {
+  (globalThis as any).fetch = async () => ({ ok: false, status: 429, json: async () => ({}) }) as any;
+  const t = (await findTransform("company-opencograph"))!;
+  const r = await t.run({ ...ocgCompanySeed }, {});
+  expect(r.entities).toEqual([]);
+  expect(r.note).toMatch(/rate limit/);
+});
+
+test("domain-opencograph: companies behind the domain, owned-by links", async () => {
+  ocgStub();
+  const t = (await findTransform("domain-opencograph"))!;
+  expect(t.inputTypes).toContain("domain");
+  expect(t.business).toBe(true);
+  expect(t.needsKey).toBeUndefined();
+  const r = await t.run({ ...ocgDomainSeed }, {});
+  const asa = r.entities.find((e) => e.type === "company" && e.value === "ACME ASA");
+  expect(asa).toBeTruthy();
+  expect(asa?.properties.country).toBe("NO");
+  expect(asa?.properties.status).toBe("Active");
+  expect(asa?.properties.domain_confidence).toBe("0.97");
+  expect(asa?.properties.website_evidence).toBe("registry-stated-website");
+  expect(asa?.properties.legal_form).toBe("ASA"); // detail enriched the row
+  expect(asa?.properties.via).toMatch(/Open Company Graph/);
+  expect(r.links.find((l) => l.to === asa!.id)?.label).toBe("owned by");
+  const ltd = r.entities.find((e) => e.type === "company" && e.value === "ACME LTD");
+  expect(ltd?.properties.domain_confidence).toBe("0.9");
+  expect(r.note).toBe("2 companies behind this domain");
+});
+
+test("domain-opencograph: not a domain → graceful empty, no fetch", async () => {
+  stubFetch(() => { throw new Error("should not fetch for a non-domain"); });
+  const t = (await findTransform("domain-opencograph"))!;
+  const r = await t.run({ ...ocgDomainSeed, value: "notadomain" }, {});
+  expect(r.entities).toEqual([]);
+  expect(r.note).toMatch(/not a domain/);
+});
+
+test("domain-opencograph: no matches → empty, not failed", async () => {
+  stubFetch((url) => {
+    expect(url).toContain("/api/v1/domain");
+    return { domain: "nothing.example", results: [] };
+  });
+  const t = (await findTransform("domain-opencograph"))!;
+  const r = await t.run({ ...ocgDomainSeed, value: "nothing.example" }, {});
+  expect(r.entities).toEqual([]);
+  expect(r.note).toMatch(/no companies behind this domain/);
 });
 
 test("ip-risk: verdict behind evidence_state, as + location entities", async () => {

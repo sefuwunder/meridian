@@ -4,9 +4,9 @@ Start from any entity — a domain, an IP, a company name, a person — and grow
 an investigation graph by running **transforms**. Each transform takes one
 entity and fans out into new entities connected by labeled links, Maltego-style.
 
-`meridian` ships **18 transforms** over free and keyless sources (Shodan
+`meridian` ships **20 transforms** over free and keyless sources (Shodan
 InternetDB, Cert Spotter, mnemonic passive DNS, IPQuery, urlscan.io, GLEIF,
-TradeRegister.fi, SEC EDGAR, OpenAlex, OpenFEC, OpenStreetMap, adsb.lol) plus two keyed ones
+TradeRegister.fi, Open Company Graph, SEC EDGAR, OpenAlex, OpenFEC, OpenStreetMap, adsb.lol) plus two keyed ones
 (Exa web search, Parallel FindAll — keys on the Keys screen, never committed).
 A unified **entity search** sits in the top bar: type anything, the type is
 auto-detected (IP, email, phone, URL, domain…), and results drop straight onto
@@ -120,10 +120,13 @@ document 📄, analyst note 📝. Entity ids are deterministic
 | `ip-intel` | ip | ISP/ASN/geo/risk (IPQuery) |
 | `ip-risk` | ip | time-decaying risk verdict + evidence taxonomy (IP99, keyless) |
 | `domain-footprint` | domain | passive DNS, CT certs, same-cert sibling domains (IP99, keyless) |
+| `domain-opencograph` | domain | companies behind the domain (Open Company Graph, keyless) |
 | `company-sudokn` | company | US manufacturers: addresses, geo, NAICS, certs (SUDOKN) |
 | `company-gleif` | company | LEI registry matches + parent companies |
 | `company-findall` | company 🔑 | AI company profile (Parallel) |
 | `company-sec` | company | SEC EDGAR filer match |
+| `company-traderegister` | company | trade registers in 62 countries, officers (TradeRegister.fi, keyless) |
+| `company-opencograph` | company | 19 open registries joined: status, LEI, industry, confirmed websites (Open Company Graph, keyless) |
 | `person-papers` | person | OpenAlex author match + papers |
 | `person-donations` | person | campaign-finance recipients (OpenFEC) |
 | `location-places` | location | nearby businesses (OpenStreetMap) |
