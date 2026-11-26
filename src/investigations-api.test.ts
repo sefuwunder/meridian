@@ -35,9 +35,9 @@ afterAll(() => { try { proc?.kill(); } catch {} });
 
 test("entity-types + transforms endpoints", async () => {
   const t = await api("/api/entity-types");
-  expect(Object.keys(t.types).length).toBe(12);
+  expect(Object.keys(t.types).length).toBe(13); // + wallet
   const tr = await api("/api/transforms");
-  expect(tr.transforms.length).toBe(20); // 21 registered, company-cyprus disabled
+  expect(tr.transforms.length).toBe(34); // 35 registered, company-cyprus disabled
   expect(tr.transforms.map((x: any) => x.key)).not.toContain("company-cyprus");
   expect(tr.transforms.every((x: any) => x.key && x.label && x.inputTypes)).toBe(true);
 });

@@ -62,6 +62,30 @@ export const KEY_DEFS: KeyDef[] = [
     signup: "https://platform.parallel.ai",
     signupLabel: "API key at platform.parallel.ai",
   },
+  {
+    id: "HELIUS_API_KEY",
+    name: "Helius",
+    required: true,
+    benefit: "activates the Helius Solana parsed-events scan — transaction history for a wallet address",
+    signup: "https://www.helius.dev/",
+    signupLabel: "free key in the Helius Dashboard",
+  },
+  {
+    id: "PATENTREF_API_KEY",
+    name: "PatentRef",
+    required: true,
+    benefit: "activates PatentRef US patent lookups (company-patents, person-patents) — free key, 1,000 requests/month",
+    signup: "https://patentref.io/api/v1/meta/signup/",
+    signupLabel: "free key at patentref.io/api/v1/meta/signup/",
+  },
+  {
+    id: "OPENALEX_API_KEY",
+    name: "OpenAlex",
+    required: false,
+    benefit: "raises OpenAlex from the 100-credit/day anonymous allowance to the free-key allowance (person-papers, company-papers)",
+    signup: "https://openalex.org/settings/api",
+    signupLabel: "free key at openalex.org/settings/api",
+  }
 ];
 
 let cache: Record<string, string> | null = null;

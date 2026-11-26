@@ -4,10 +4,10 @@ Start from any entity — a domain, an IP, a company name, a person — and grow
 an investigation graph by running **transforms**. Each transform takes one
 entity and fans out into new entities connected by labeled links, Maltego-style.
 
-`meridian` ships **20 transforms** over free and keyless sources (Shodan
+`meridian` ships **35 transforms** over free and keyless sources (Shodan
 InternetDB, Cert Spotter, mnemonic passive DNS, IPQuery, urlscan.io, GLEIF,
-TradeRegister.fi, Open Company Graph, SEC EDGAR, OpenAlex, OpenFEC, OpenStreetMap, adsb.lol) plus two keyed ones
-(Exa web search, Parallel FindAll — keys on the Keys screen, never committed).
+TradeRegister.fi, Open Company Graph, SEC EDGAR, OpenAlex, OpenFEC, OpenStreetMap, adsb.lol, CompanyRegistryAPI.com, W System, RegBase, crt.name, VPNDetection, Ironflow, FreeSpy, Vendor History, Captain Drawdown, Orelys) plus four keyed ones
+(Exa web search, Parallel FindAll, Helius Solana scan, PatentRef — keys on the Keys screen, never committed; OpenAlex takes an optional free key that raises its allowance).
 A unified **entity search** sits in the top bar: type anything, the type is
 auto-detected (IP, email, phone, URL, domain…), and results drop straight onto
 the graph. Everything persists in SQLite; investigations export as JSON.
@@ -102,6 +102,107 @@ lite.commit()
 print("places:", lite.execute("SELECT COUNT(*) FROM places").fetchone()[0])
 ```
 
+## Bulk import (OpenDataFoundation)
+
+OpenDataFoundation/opendata is a **bulk-only** dataset: ~103M companies
+(plus ~273M business locations) as 1,000 Parquet shards (2.8 GB
+download, ~12 GB decoded) on Hugging Face. There is no supported
+per-company query API, so Meridian does not query it live. Instead,
+download the `companies` config once, load it into a local SQLite
+database, and query it offline.
+
+**What it carries (companies config):** company name + legal name,
+street address (line 1/2, city, state, ZIP, country + ISO codes),
+latitude/longitude, website, LinkedIn/Crunchbase URLs, and identifiers
+— CIK, LEI, ISIN, PermID, OpenFIGI, SAM UEI, CAGE code, PitchBook ID,
+Cap IQ ID, ticker(s), Placekey. Every row is a business location, so
+one company can appear many times.
+
+**Licence: none stated.** The dataset page and the datasets-server
+`info` endpoint both return an empty licence field. Treat the data as
+unlicensed: use it for internal lookup only, do not redistribute it,
+and re-check the dataset page for a licence before any other use.
+
+**The `people` config is never touched.** It is person data and is
+excluded from this import by policy — download the `companies` config
+only.
+
+**Import (one-time, on the machine that runs Meridian):**
+
+```sh
+# 1. Download the companies config only (Parquet shards)
+huggingface-cli download OpenDataFoundation/opendata \
+  --repo-type dataset --include "companies/*" --local-dir ./opendata
+
+# 2. Load into SQLite (needs python3 + pyarrow + pandas)
+python3 - <<'EOF'
+import glob, sqlite3
+import pyarrow.parquet as pq
+db = sqlite3.connect("data/opendata-companies.db")
+db.execute("""CREATE TABLE IF NOT EXISTS companies (
+  bq_id INTEGER PRIMARY KEY, bq_company_name TEXT, bq_company_legal_name TEXT,
+  bq_company_address1_line_1 TEXT, bq_company_address1_line_2 TEXT,
+  bq_company_address1_city TEXT, bq_company_address1_state TEXT,
+  bq_company_address1_zip5 TEXT, bq_company_address1_country TEXT,
+  bq_company_address1_country_code2 TEXT, bq_company_address1_latitude TEXT,
+  bq_company_address1_longitude TEXT, bq_website TEXT,
+  bq_cik TEXT, bq_company_lei TEXT, bq_sam_uei TEXT, bq_sam_cage_code TEXT)""")
+cols = [c for c in
+  "bq_id bq_company_name bq_company_legal_name bq_company_address1_line_1 "
+  "bq_company_address1_line_2 bq_company_address1_city bq_company_address1_state "
+  "bq_company_address1_zip5 bq_company_address1_country bq_company_address1_country_code2 "
+  "bq_company_address1_latitude bq_company_address1_longitude bq_website "
+  "bq_cik bq_company_lei bq_sam_uei bq_sam_cage_code".split()]
+for f in sorted(glob.glob("opendata/companies/*.parquet")):
+    rows = pq.read_table(f, columns=cols).to_pylist()
+    db.executemany(f"INSERT OR IGNORE INTO companies VALUES ({','.join('?'*len(cols))})",
+                   [[r.get(c) for c in cols] for r in rows])
+db.execute("CREATE INDEX IF NOT EXISTS idx_company_name ON companies(bq_company_name)")
+db.commit()
+print("rows:", db.execute("SELECT COUNT(*) FROM companies").fetchone()[0])
+EOF
+```
+
+Query offline, e.g.
+`SELECT * FROM companies WHERE bq_company_name LIKE '%Acme%' LIMIT 5;`
+— street/city/ZIP/lat-lon plus LEI/CIK/SAM UEI/CAGE come back on every
+row. Re-download when a new snapshot lands; the import above is
+idempotent (`INSERT OR IGNORE` on `bq_id`).
+
+**Why not a live transform (checked 2026-11-26):**
+
+- `GET /rows?dataset=OpenDataFoundation/opendata&config=companies&split=train&offset=0&length=5`
+  → HTTP 200. First rows confirmed (e.g. `INFINITE DISPLAYS, INC`,
+  `702 Kingswood Pl, Brandon, FL 33511`, lat `27.91065`, lon
+  `-82.29405`). The endpoint only pages the head of the dataset — it
+  cannot find a named company.
+- `GET /info?dataset=OpenDataFoundation/opendata&config=companies`
+  → HTTP 200. Column list confirmed (see above); `license: ""`
+  (empty — no licence stated); `splits.train.num_examples`:
+  102,989,288; `download_size` 5,835,675,642.
+- `GET /filter?...&where=bq_company_name like '%Acme%'` → **HTTP 422**
+  `{"error":"Parameter 'where' contains errors or invalid symbols"}`.
+  Also 422 for an exact match
+  (`bq_company_name = 'INFINITE DISPLAYS, INC'`, a name taken from the
+  live `/rows` response) and for a prefix `LIKE 'ACME%'`. The filter
+  endpoint rejects `where` clauses for this dataset outright — no
+  server-side name lookup is possible.
+- `GET /search?dataset=OpenDataFoundation/opendata&config=companies&split=train&query=Acme&length=5`
+  → HTTP 200 on two of three tries, returning real matches
+  (`num_rows_total: 6518`; `ACME TELEVISION, INC`, `5852 U.S. 31 North
+  Acme, Acme, MI 49610`, lat `44.7648`, lon `-85.50655`) — but it took
+  **52 s** and **~110 s** on the successes and **HTTP 504 after ~60 s**
+  on the third try. A 1–2 minute, sometimes-failing lookup is not a
+  usable per-query transform (the transform layer times out at 20 s
+  by default), so no `company-opendata` transform was written. If the
+  datasets-server search ever gets fast and reliable for this dataset,
+  the transform is a thin wrapper over that one endpoint: `query=<name>`,
+  filter rows client-side by substring on `bq_company_name`, cap 5,
+  emit `location` entities (street/city/ZIP/lat-lon) with LEI/CIK/SAM
+  UEI/CAGE properties, `business: true`, description tagged
+  `[address-data]` with the no-licence caveat and the people-config
+  exclusion.
+
 ## Entities
 
 Twelve types, each with its own icon and color: domain 🌐, IP 🖧, person 👤,
@@ -127,7 +228,21 @@ document 📄, analyst note 📝. Entity ids are deterministic
 | `company-sec` | company | SEC EDGAR filer match |
 | `company-traderegister` | company | trade registers in 62 countries, officers (TradeRegister.fi, keyless) |
 | `company-opencograph` | company | 19 open registries joined: status, LEI, industry, confirmed websites (Open Company Graph, keyless) |
-| `person-papers` | person | OpenAlex author match + papers |
+| `company-companyregistry` | company | company registers in ~100 countries, officers (CompanyRegistryAPI.com / Coragrid, keyless) |
+| `company-wsystem` | company | EU company registry: street address, VAT ID, LEI (W System, keyless) |
+| `company-regbase` | company | Ed25519-signed Japan verification record by 13-digit corporate number (RegBase, keyless) |
+| `company-patents` | company 🔑 | US patents granted to this assignee (PatentRef, keyed-free, 1,000 req/mo) |
+| `company-papers` | company | papers from this organisation's researchers (OpenAlex institutions + works; free key optional) |
+| `company-vendorhistory` | company | breach notices, SEC 8-K cyber filings, ransomware claims (flagged unconfirmed), CISA KEV flaws (Vendor History, CC BY 4.0; 255 tracked vendors — empty means 'not tracked') |
+| `company-cdr` | company | carbon-removal companies: pathway, country, liveliness, size, registry (Captain Drawdown CDR Directory, 1,062 companies; CC BY-NC-SA 4.0 — non-commercial reuse only) |
+| `email-orelys` | email | breach exposure: breach names + data-type categories only, never record values (Orelys, keyless) |
+| `domain-crtname` | domain | CT subdomain index — historical, includes long-dead hosts (crt.name, keyless, 100/day) |
+| `ip-vpndetection` | ip | VPN / Tor / relay / anycast flags + ASN + location (VPNDetection, keyless) |
+| `wallet-fills` | wallet | recent Hyperliquid fills for a wallet, last 24h (Ironflow, keyless, 100 credits/day) |
+| `wallet-helius` | wallet 🔑 | Solana wallet history scan — SOL/token activity (Helius Parsed Events, keyed-free, ~11 credits/run) |
+| `phone-freespy` | phone | carrier, line type, spam score, area-code geography (FreeSpy, keyless) |
+| `person-papers` | person | OpenAlex author match + papers (free key optional, raises the anonymous allowance) |
+| `person-patents` | person 🔑 | US patents naming this inventor — public-filing mentions (PatentRef, keyed-free, 1,000 req/mo) |
 | `person-donations` | person | campaign-finance recipients (OpenFEC) |
 | `location-places` | location | nearby businesses (OpenStreetMap) |
 | `location-aircraft` | location | live aircraft overhead (ADS-B) |

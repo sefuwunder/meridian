@@ -378,6 +378,9 @@ const server = Bun.serve({
             const keys: Record<string, string> = {};
             if (t.needsKey === "exa") keys.exa = resolveKey("EXA_API_KEY");
             if (t.needsKey === "parallel") keys.parallel = resolveKey("PARALLEL_API_KEY");
+            if (t.needsKey === "helius") keys.helius = resolveKey("HELIUS_API_KEY");
+            if (t.needsKey === "patentref") keys.patentref = resolveKey("PATENTREF_API_KEY");
+            if (t.needsKey === "openalex") keys.openalex = resolveKey("OPENALEX_API_KEY");
             const r = await t.run(target, keys);
             const have = new Set(inv.entities.map((x: Entity) => x.id));
             let addedE = 0, addedL = 0;
